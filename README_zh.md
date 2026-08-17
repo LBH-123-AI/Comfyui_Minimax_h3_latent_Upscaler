@@ -92,10 +92,8 @@ Comfyui_Minimax_h3_latent_Upscaler/
 
    ```bash
    cd ComfyUI/custom_nodes
-   git clone https://github.com/YOUR_USERNAME/Comfyui_Minimax_h3_latent_Upscaler.git
+   git clone https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler.git
    ```
-
-   > ⚠️ 请把 `YOUR_USERNAME` 替换为你真实的 GitHub 用户名 / 仓库路径。
 
 2. 所需依赖（`torch`、`einops`、`safetensors`）在标准 ComfyUI 环境中已自带，无需额外安装。
 
@@ -112,6 +110,9 @@ ComfyUI/models/latent_upscale_models/
 ```
 
 把你的 Minimax H3 latent 放大模型权重（`.safetensors` 或 `.pth`）放进该目录，节点下拉框会自动列出。
+
+预训练权重可在此下载：
+[huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
 
 加载器会自动识别结构，只要权重存储的结构匹配，2D 与 3D 节点可共用同一份权重。
 
@@ -191,4 +192,5 @@ ComfyUI/models/latent_upscale_models/
 
 本节点沿用了 **Ttl** 提出的「神经网络 latent 放大」思路
 （[ComfyUi_NNLatentUpscale](https://github.com/Ttl/ComfyUi_NNLatentUpscale)，
-https://github.com/Ttl）。感谢其开源贡献为本工作奠定基础。
+https://github.com/Ttl）。本项目模型架构同时参考借鉴了 **LTX 2.3 Spatial Upscaler**
+（`ltx-2.3-spatial-upscaler-x2-1.1.safetensors`）。感谢这些开源工作为本项目奠定基础。
