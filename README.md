@@ -101,10 +101,8 @@ cached by `(name, device, precision)` so repeated runs stay cheap.
 
    ```bash
    cd ComfyUI/custom_nodes
-   git clone https://github.com/YOUR_USERNAME/Comfyui_Minimax_h3_latent_Upscaler.git
+   git clone https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler.git
    ```
-
-   > ⚠️ Replace `YOUR_USERNAME` with your actual GitHub username / repository path.
 
 2. Required dependencies (`torch`, `einops`, `safetensors`) are already present in a standard
    ComfyUI environment — no extra install needed.
@@ -123,6 +121,9 @@ ComfyUI/models/latent_upscale_models/
 
 Put your Minimax H3 latent upscaler checkpoint (`.safetensors` or `.pth`) there. It will appear
 automatically in the node's `model_name` dropdown.
+
+Pre-trained checkpoints are available at:
+[huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
 
 The loader auto-detects the architecture, so a single checkpoint works for both the 2D and 3D
 nodes as long as the stored structure matches.
@@ -209,4 +210,6 @@ buckets — letting the model handle any continuous `scale` in the 1.0×–4.0×
 
 This node follows the neural-latent-upscaling approach pioneered by
 [ComfyUi_NNLatentUpscale](https://github.com/Ttl/ComfyUi_NNLatentUpscale) by **Ttl**
-(https://github.com/Ttl). Thanks for the open-source foundation this work builds upon.
+(https://github.com/Ttl). The model architecture also draws on and references the
+**LTX 2.3 Spatial Upscaler** (`ltx-2.3-spatial-upscaler-x2-1.1.safetensors`).
+Thanks to both projects for the open-source foundation this work builds upon.
