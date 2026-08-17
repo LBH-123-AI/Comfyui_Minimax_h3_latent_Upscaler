@@ -39,10 +39,13 @@
 
 ## 📸 示例
 
-| 文件 | 说明 |
-| :--- | :--- |
-| `examples/Minimax_h3_latent_Upscaler_001.mp4` | 视频放大对比 |
-| `examples/Minimax_h3_latent_Upscaler_002.jpg` | 图像放大对比 |
+**视频放大对比**
+
+<video src="examples/Minimax_h3_latent_Upscaler_001.mp4" controls width="640"></video>
+
+**图像放大对比**
+
+![](examples/Minimax_h3_latent_Upscaler_002.jpg)
 
 ---
 
