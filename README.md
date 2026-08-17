@@ -44,10 +44,13 @@ Two node variants are provided, both registered under the `video/MinimaxH3` cate
 
 ## 📸 Examples
 
-| File | Description |
-| :--- | :--- |
-| `examples/Minimax_h3_latent_Upscaler_001.mp4` | Video upscale comparison |
-| `examples/Minimax_h3_latent_Upscaler_002.jpg` | Image upscale comparison |
+**Video upscale comparison**
+
+<video src="examples/Minimax_h3_latent_Upscaler_001.mp4" controls width="640"></video>
+
+**Image upscale comparison**
+
+![](examples/Minimax_h3_latent_Upscaler_002.jpg)
 
 ---
 
