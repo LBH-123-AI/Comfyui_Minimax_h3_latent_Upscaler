@@ -1,2 +1,209 @@
-# Comfyui_Minimax_h3_latent_Upscaler
-A custom ComfyUI node that upscales **Minimax H3** VAE latents (24 channels) with a trained neural network instead of naive interpolation. Its main purpose is to **accelerate high-resolution video generation** and improve quality:  - **Skip the slow decode → pixel-upscale → encode round-trip.** Minimax H3 ships a heavy   ~5B-parameter VAE, so decoding and re-encoding latents is expensive. Upscaling directly in   latent space avoids that costly round-trip entirely. - **Enable a faster generation pipeline:** generate at low resolution (far fewer latent tokens),   upscale the latent with this node, then refine at the target resolution.
+<p align="center">
+  <a href="./README.md"><strong>English</strong></a> ·
+  <a href="./README_zh.md">中文</a>
+</p>
+
+<div align="center">
+
+# ComfyUI Minimax H3 Latent Upscaler
+
+**Neural Latent Upscaler for Minimax H3 Video Generation**
+Learned · High-fidelity · 2D & 3D Variants
+
+</div>
+
+A custom ComfyUI node that upscales **Minimax H3** VAE latents (24 channels) with a trained
+neural network instead of naive interpolation. Its main purpose is to **accelerate
+high-resolution video generation** and improve quality:
+
+- **Skip the slow decode → pixel-upscale → encode round-trip.** Minimax H3 ships a heavy
+  ~5B-parameter VAE, so decoding and re-encoding latents is expensive. Upscaling directly in
+  latent space avoids that costly round-trip entirely.
+- **Enable a faster generation pipeline:** generate at low resolution (far fewer latent tokens),
+  upscale the latent with this node, then refine at the target resolution.
+
+It also **avoids the ghosting / double-image artifacts** that naive latent interpolation
+(bilinear/bicubic) introduces, and plays a role similar to the latent upscaler in **LTX2.3**.
+
+⚠️ This saves **time, not VRAM** — the refinement pass still runs at the target resolution, so
+peak memory is comparable to generating high-res directly. The win is purely speed.
+
+Two node variants are provided, both registered under the `video/MinimaxH3` category:
+
+- **Minimax H3 Latent Upscaler (2D)** — a 2D ResBlock backbone with Temporal 3D-Conv layers
+  inserted for temporal consistency. Spatial (H×W) upscaling; the time dimension is preserved.
+  Lightweight and fast.
+- **Minimax H3 Latent Upscaler (3D)** — a fully 3D-convolution backbone (3D ResBlocks +
+  TemporalConv + trilinear interpolation). Processes the spatiotemporal volume jointly for
+  stronger temporal coherence; heavier on compute/memory.
+
+> Both variants support **upscaling only** (`scale >= 1.0`). `scale = 1.0` returns the input
+> unchanged; `scale < 1.0` raises an error.
+
+---
+
+## 📸 Examples
+
+| File | Description |
+| :--- | :--- |
+| `examples/Minimax_h3_latent_Upscaler_001.mp4` | Video upscale comparison |
+| `examples/Minimax_h3_latent_Upscaler_002.jpg` | Image upscale comparison |
+
+---
+
+## 📁 Project Structure
+
+```text
+Comfyui_Minimax_h3_latent_Upscaler/
+├── examples/
+│   ├── Minimax_h3_latent_Upscaler_001.mp4
+│   └── Minimax_h3_latent_Upscaler_002.jpg
+├── nodes/
+│   ├── __init__.py                       # merges 2D / 3D node mappings
+│   ├── minimax_h3_latent_upscaler_2d.py  # 2D backbone + Temporal 3D Conv
+│   └── minimax_h3_latent_upscaler_3d.py  # pure 3D convolution
+├── README.md
+├── README_zh.md
+└── __init__.py
+```
+
+> The model weights are **not** included in this repo. Place them in your ComfyUI models folder
+> (see Model Placement below).
+
+---
+
+## 🚀 Key Features
+
+- ✅ **Learned latent upscaling** — neural network trained for Minimax H3 latents, far sharper
+  than bilinear/bicubic interpolation.
+- ✅ **Two backbones** — pick the fast **2D** variant or the temporally-coherent **3D** variant.
+- ✅ **Arbitrary scale 1.0×–4.0×** — continuous `scale` with 0.1 step (default 2.0).
+- ✅ **24-channel Minimax H3 latent** — uses the exact per-channel mean/std normalization from
+  training.
+- ✅ **Auto architecture detection** — reads `in_channels`, block counts, temporal config and
+  kernel size straight from the checkpoint; no manual config needed.
+- ✅ **Robust weight loader** — supports `.safetensors` and `.pth`; auto-converts FP8→FP16;
+  tolerates the `upscaler.` prefix in merged checkpoints.
+- ✅ **Flexible precision/device** — `cuda`/`cpu` and fp32/fp16/bf16 options.
+- ✅ **Plug-and-play** — standard ComfyUI node, no changes to your existing workflow.
+
+Inference forces attention **off** (`attn=False`) for speed and stability. Loaded models are
+cached by `(name, device, precision)` so repeated runs stay cheap.
+
+---
+
+## 📦 Installation
+
+1. Clone this repository into ComfyUI's `custom_nodes` folder:
+
+   ```bash
+   cd ComfyUI/custom_nodes
+   git clone https://github.com/YOUR_USERNAME/Comfyui_Minimax_h3_latent_Upscaler.git
+   ```
+
+   > ⚠️ Replace `YOUR_USERNAME` with your actual GitHub username / repository path.
+
+2. Required dependencies (`torch`, `einops`, `safetensors`) are already present in a standard
+   ComfyUI environment — no extra install needed.
+
+3. Restart ComfyUI.
+
+---
+
+## 🤖 Model Placement
+
+The nodes scan and load weights from:
+
+```text
+ComfyUI/models/latent_upscale_models/
+```
+
+Put your Minimax H3 latent upscaler checkpoint (`.safetensors` or `.pth`) there. It will appear
+automatically in the node's `model_name` dropdown.
+
+The loader auto-detects the architecture, so a single checkpoint works for both the 2D and 3D
+nodes as long as the stored structure matches.
+
+---
+
+## 🧩 Usage
+
+Add either **"Minimax H3 Latent Upscaler (2D)"** or **"Minimax H3 Latent Upscaler (3D)"** from the
+`video/MinimaxH3` menu, connect a `LATENT`, pick the model, set the `scale`, and decode.
+
+**Typical workflow:**
+- **Quick preview:** `[Minimax H3 Latent] → [H3 Latent Upscaler] → [VAE Decode]`
+- **High quality / time-saving (recommended):** `[Low-res Latent] → [H3 Latent Upscaler] → [Refine / Re-sample] → [VAE Decode]`
+
+Compared to the naive approach `[Latent] → [VAE Decode] → [Pixel Upscaler] → [VAE Encode] → …`,
+upscaling directly in latent space skips the expensive VAE decode/encode round-trip. Minimax H3's
+~5B-parameter VAE makes decode and re-encode notably slow, so this is where most of the time is
+saved. It also avoids the **ghosting / double-image artifacts** that direct latent interpolation
+(bilinear/bicubic) causes.
+
+⚠️ **Saves time, not VRAM:** the refinement still runs at the target resolution, so peak memory is
+roughly the same as generating high-res directly. The benefit is purely faster turnaround.
+
+### Node Reference
+
+| Parameter | Type | Default | Range / Options | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `latent` | LATENT | — | — | Input Minimax H3 latent (B,C,T,H,W) or (B,C,H,W) |
+| `model_name` | dropdown | auto | scanned files | Checkpoint in `latent_upscale_models/` |
+| `scale` | FLOAT | 2.0 | 1.0 – 4.0 (step 0.1) | Spatial upscale factor |
+| `device` | dropdown | cuda | cuda / cpu | Inference device |
+| `precision` | dropdown | fp32 | fp32 / fp16 / bf16 | Inference precision. fp16/bf16 use less memory and run faster; fp32 is most accurate |
+
+**Output:** `LATENT` — the upscaled latent, ready for VAE decode.
+
+> **2D vs 3D — which to pick?** Use **2D** for speed and when frames are already temporally
+> stable; use **3D** when you need stronger motion/temporal coherence.
+
+---
+
+## 🧪 Model / Architecture
+
+- **Latent format:** 24-channel Minimax H3 VAE latent, normalized per-channel with the training
+  mean/std before inference and de-normalized after.
+- **Default detected architecture** (overridden automatically if the checkpoint differs):
+  `in_channels=24`, `in_blocks=12`, `out_blocks=12`, `base_channels=512`, `dropout=0.1`,
+  `temporal_every=2`, `temporal_kernel=5`, `attn=False`.
+- **Interpolation:** the 2D node uses bilinear feature interpolation; the 3D node uses trilinear.
+- **Temporal handling:** both variants preserve the time dimension (only H×W are scaled).
+
+---
+
+## 📊 Training Data
+
+The upscaler was trained on **~80,000 paired samples** (a low-resolution latent paired with its
+high-resolution target), balanced across modalities and scale factors to maximize generalization.
+
+**By data modality:**
+
+| Modality | Pairs | Share |
+| :--- | :--- | :--- |
+| Video clips | ~70,000 | ~87.5% |
+| 2K images | ~8,000 | ~10% |
+
+**By upscale factor (scale distribution, approximate):**
+
+| Scale | Share | Note |
+| :--- | :--- | :--- |
+| 2× | 40% | Dominant factor — the most common real-world case |
+| 1.5× | 10% | — |
+| 2.5× | 10% | — |
+| 3× | 10% | — |
+| 4× | 10% | — |
+| 1.0×–4.0× (arbitrary decimals) | 10% | Improves generalization to in-between / non-fixed scales |
+
+The heavy emphasis on **2× (40%)** matches the most common practical use case, while the **10% spread
+of arbitrary decimal scales between 1 and 4** prevents overfitting to the fixed 1.5×/2×/2.5×/3×/4×
+buckets — letting the model handle any continuous `scale` in the 1.0×–4.0× range at inference time.
+
+---
+
+## 🙏 Acknowledgments
+
+This node follows the neural-latent-upscaling approach pioneered by
+[ComfyUi_NNLatentUpscale](https://github.com/Ttl/ComfyUi_NNLatentUpscale) by **Ttl**
+(https://github.com/Ttl). Thanks for the open-source foundation this work builds upon.
