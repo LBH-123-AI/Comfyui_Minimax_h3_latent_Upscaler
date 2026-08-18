@@ -28,8 +28,11 @@ It also **avoids the ghosting / double-image artifacts** that naive latent inter
 ⚠️ This saves **time, not VRAM** — the refinement pass still runs at the target resolution, so
 peak memory is comparable to generating high-res directly. The win is purely speed.
 
-Two node variants are provided, both registered under the `video/MinimaxH3` category:
+Several node variants are provided, all registered under the `video/MinimaxH3` category:
 
+Three ways to choose the output size, all registered under `video/MinimaxH3`:
+
+**By scale factor** (the original nodes):
 - **Minimax H3 Latent Upscaler (2D)** — a 2D ResBlock backbone with Temporal 3D-Conv layers
   inserted for temporal consistency. Spatial (H×W) upscaling; the time dimension is preserved.
   Lightweight and fast.
@@ -37,8 +40,23 @@ Two node variants are provided, both registered under the `video/MinimaxH3` cate
   TemporalConv + trilinear interpolation). Processes the spatiotemporal volume jointly for
   stronger temporal coherence; heavier on compute/memory.
 
-> Both variants support **upscaling only** (`scale >= 1.0`). `scale = 1.0` returns the input
-> unchanged; `scale < 1.0` raises an error.
+**By explicit size** (community-contributed, 3D backbone):
+- **H3 Latent Upscaler (Target Resolution)** — set the target pixel `width`/`height` directly;
+  the node aligns the latent to a configurable grid (8 / 16 / 32 …) and derives the scale factor
+  automatically. Great when you know the exact output resolution.
+- **H3 Latent Upscaler (Megapixels)** — set a target total pixel count in megapixels (e.g. `1.2`),
+  keep the original aspect ratio, align to the grid, and derive the scale factor automatically.
+  Great for "I just want ~1.2 MP" workflows.
+- **H3 Latent Cond Sync (3D)** — a pass-through helper (no upscaling). It reads the current latent
+  size and synchronizes `positive`/`negative` `CONDITIONING` image refs to that size, so the
+  second-stage refine/re-sample pass won't hit a size mismatch. Place it right after an upscaler.
+
+> The two "explicit size" nodes compute the equivalent `scale` internally and feed it to the same
+> trained model, so any target between 1.0×–4.0× works. They also keep the audio latent untouched.
+
+> The three upscaling nodes support **upscaling only** (`scale >= 1.0`). `scale = 1.0` returns the
+> input unchanged; `scale < 1.0` raises an error. **H3 Latent Cond Sync** is not an upscaler — it
+> just passes the latent through and resizes the conditioning to match.
 
 ---
 
@@ -61,10 +79,17 @@ Comfyui_Minimax_h3_latent_Upscaler/
 ├── examples/
 │   ├── Minimax_h3_latent_Upscaler_001.mp4
 │   └── Minimax_h3_latent_Upscaler_002.jpg
+├── workflow_templates/
+│   └── minimax_h3_r2v_Latent Upscaler example workflow.json  # example workflow for ComfyUI templates
 ├── nodes/
-│   ├── __init__.py                       # merges 2D / 3D node mappings
-│   ├── minimax_h3_latent_upscaler_2d.py  # 2D backbone + Temporal 3D Conv
-│   └── minimax_h3_latent_upscaler_3d.py  # pure 3D convolution
+│   ├── __init__.py                       # merges all node mappings
+│   ├── minimax_h3_latent_upscaler_2d.py  # 2D backbone + Temporal 3D Conv (scale mode)
+│   ├── minimax_h3_latent_upscaler_3d.py  # pure 3D convolution (scale mode)
+│   ├── h3_upscaler_common.py             # shared model load + 3D inference logic
+│   ├── H3_latent_upscaler_resolution.py  # explicit target resolution node (community)
+│   ├── H3_latent_upscaler_megapixels.py  # megapixels target node (community)
+│   ├── H3_latent_upscaler_3d_v3.py       # Cond Sync passthrough: sync CONDITIONING to latent size (community)
+│   └── H3LatentResize.py                 # shared conditioning resize helper
 ├── README.md
 ├── README_zh.md
 └── __init__.py
@@ -132,8 +157,8 @@ nodes as long as the stored structure matches.
 
 ## 🧩 Usage
 
-Add either **"Minimax H3 Latent Upscaler (2D)"** or **"Minimax H3 Latent Upscaler (3D)"** from the
-`video/MinimaxH3` menu, connect a `LATENT`, pick the model, set the `scale`, and decode.
+Add the node you need from the `video/MinimaxH3` menu, connect a `LATENT`, pick the model, set the
+resize mode / scale, and decode.
 
 **Typical workflow:**
 - **Quick preview:** `[Minimax H3 Latent] → [H3 Latent Upscaler] → [VAE Decode]`
@@ -148,7 +173,7 @@ saved. It also avoids the **ghosting / double-image artifacts** that direct late
 ⚠️ **Saves time, not VRAM:** the refinement still runs at the target resolution, so peak memory is
 roughly the same as generating high-res directly. The benefit is purely faster turnaround.
 
-### Node Reference
+### Node Reference — 2D / 3D (classic)
 
 | Parameter | Type | Default | Range / Options | Description |
 | :--- | :--- | :--- | :--- | :--- |
@@ -160,8 +185,52 @@ roughly the same as generating high-res directly. The benefit is purely faster t
 
 **Output:** `LATENT` — the upscaled latent, ready for VAE decode.
 
-> **2D vs 3D — which to pick?** Use **2D** for speed and when frames are already temporally
-> stable; use **3D** when you need stronger motion/temporal coherence.
+### Node Reference — Target Resolution (3D, community)
+
+| Parameter | Type | Default | Range / Options | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `latent` | LATENT | — | — | Input Minimax H3 latent (B,C,T,H,W) or (B,C,H,W) |
+| `model_name` | dropdown | auto | scanned files | Checkpoint in `latent_upscale_models/` |
+| `width` | INT | 768 | ≥ 1 | Target pixel **width** |
+| `height` | INT | 432 | ≥ 1 | Target pixel **height** |
+| `align` | INT | 16 | 2,4,6,… (step 2) | Latent-grid divisor (8/16/32…); target latent H×W is rounded up to a multiple of `align` |
+| `device` | dropdown | cuda | cuda / cpu | Inference device |
+| `precision` | dropdown | fp32 | fp32 / fp16 / bf16 | Inference precision |
+
+**Output:** `LATENT` — the upscaled latent. The effective scale is derived from `width`/`height` and `align`.
+
+### Node Reference — Megapixels (3D, community)
+
+| Parameter | Type | Default | Range / Options | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `latent` | LATENT | — | — | Input Minimax H3 latent (B,C,T,H,W) or (B,C,H,W) |
+| `model_name` | dropdown | auto | scanned files | Checkpoint in `latent_upscale_models/` |
+| `target_megapixels` | FLOAT | 1.2 | 0.1 – 8.0 (step 0.1) | Target total megapixels; aspect ratio is kept |
+| `align` | INT | 16 | 2,4,6,… (step 2) | Latent-grid divisor (8/16/32…); target latent H×W is rounded up to a multiple of `align` |
+| `device` | dropdown | cuda | cuda / cpu | Inference device |
+| `precision` | dropdown | fp32 | fp32 / fp16 / bf16 | Inference precision |
+
+**Output:** `LATENT` — the upscaled latent. The effective scale is derived from the computed pixel size and `align`.
+
+### Node Reference — Cond Sync (3D, community)
+
+| Parameter | Type | Default | Range / Options | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `latent` | LATENT | — | — | Input latent (already upscaled by a previous node). Passed through unchanged |
+| `positive` | CONDITIONING | optional | — | Positive conditioning; image refs are resized to the latent's current size |
+| `negative` | CONDITIONING | optional | — | Negative conditioning; image refs are resized to the latent's current size |
+
+**Outputs:** `(LATENT, CONDITIONING, CONDITIONING)` — the unchanged latent + resized positive + resized negative.
+
+> This node does **no upscaling** — it only syncs the conditioning to the latent's current
+> resolution. Chain it right after an upscaler so the second-stage refine/re-sample pass gets
+> matching sizes.
+
+> **Which node to pick?** Use **2D / 3D (scale)** for a simple `1.0×–4.0×` factor. Use
+> **Target Resolution** when you know the exact output WIDTH×HEIGHT. Use **Megapixels** for a
+> "I just want ~1.2 MP" workflow. Use **Cond Sync** after an upscaler when the second-stage refine
+> needs the `CONDITIONING` resized to match. The two explicit-size nodes share one model via
+> `h3_upscaler_common.py`.
 
 ---
 
