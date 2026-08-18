@@ -26,14 +26,28 @@
 ⚠️ 它节省的是**时间，不是显存** —— 精修阶段仍在目标分辨率下运行，峰值显存与直接高清生成接近，
 收益纯粹是更快出片。
 
-提供两个节点变体，均注册在 `video/MinimaxH3` 分类下：
+提供三种选择输出尺寸的方式，均注册在 `video/MinimaxH3` 分类下：
 
+**按放大倍数**（原版节点）：
 - **Minimax H3 Latent Upscaler (2D)**：2D 残差主干 + 穿插的时序 3D 卷积，仅做空间（H×W）放大，
   时间维度保持不变，轻量且快速。
 - **Minimax H3 Latent Upscaler (3D)**：纯 3D 卷积主干（3D 残差块 + 时序卷积 + 三线性插值），
   联合处理时空体，时间一致性更强，但算力/显存开销更高。
 
-> 两个节点均**只支持放大**（`scale >= 1.0`）。`scale = 1.0` 返回输入原样；`scale < 1.0` 会报错。
+**按明确尺寸**（社区补全，纯 3D 主干）：
+- **H3 Latent Upscaler (Target Resolution)**：直接填目标像素 `width` / `height`，节点会按可配置的
+  网格（8 / 16 / 32 …）对齐 latent 并自动反推放大倍率。适合「我知道确切输出分辨率」的场景。
+- **H3 Latent Upscaler (Megapixels)**：填目标总像素（百万像素，例如 `1.2`），保持原宽高比、按网格
+  对齐，并自动反推放大倍率。适合「我就想要约 1.2MP」的工作流。
+- **H3 Latent Cond Sync (3D)**：纯透传辅助节点（不做放大）。读取当前 latent 尺寸，把 `positive` /
+  `negative` 的 `CONDITIONING` 中图像引用同步 resize 到该尺寸，避免第二阶段精修时出现尺寸不匹配。
+  放在某个放大节点之后即可。
+
+> 两个「明确尺寸」节点会在内部计算出等效 `scale` 并喂给同一个训练好的模型，因此 1.0×–4.0× 之间
+> 任意目标都能用；同时它们保持音频 latent 不被放大。
+
+> 三个放大节点均**只支持放大**（`scale >= 1.0`）。`scale = 1.0` 返回输入原样；`scale < 1.0` 会报错。
+> **H3 Latent Cond Sync** 不是放大节点 —— 它只透传 latent 并把 conditioning 同步到对应尺寸。
 
 ---
 
@@ -56,10 +70,17 @@ Comfyui_Minimax_h3_latent_Upscaler/
 ├── examples/
 │   ├── Minimax_h3_latent_Upscaler_001.mp4
 │   └── Minimax_h3_latent_Upscaler_002.jpg
+├── workflow_templates/
+│   └── minimax_h3_r2v_Latent Upscaler example workflow.json  # ComfyUI 模板示例工作流
 ├── nodes/
-│   ├── __init__.py                       # 合并 2D / 3D 节点映射
-│   ├── minimax_h3_latent_upscaler_2d.py  # 2D 主干 + Temporal 3D Conv
-│   └── minimax_h3_latent_upscaler_3d.py  # 纯 3D 卷积
+│   ├── __init__.py                       # 合并全部节点映射
+│   ├── minimax_h3_latent_upscaler_2d.py  # 2D 主干 + Temporal 3D Conv（倍数模式）
+│   ├── minimax_h3_latent_upscaler_3d.py  # 纯 3D 卷积（倍数模式）
+│   ├── h3_upscaler_common.py             # 公共模型加载 + 3D 推理逻辑
+│   ├── H3_latent_upscaler_resolution.py  # 按目标分辨率节点（社区）
+│   ├── H3_latent_upscaler_megapixels.py  # 按百万像素节点（社区）
+│   ├── H3_latent_upscaler_3d_v3.py       # Cond Sync 透传：把 CONDITIONING 同步到 latent 尺寸（社区）
+│   └── H3LatentResize.py                 # 共享的 conditioning resize 辅助函数
 ├── README.md
 ├── README_zh.md
 └── __init__.py
@@ -120,8 +141,7 @@ ComfyUI/models/latent_upscale_models/
 
 ## 🧩 使用方法
 
-从 `video/MinimaxH3` 菜单中添加 **「Minimax H3 Latent Upscaler (2D)」** 或
-**「Minimax H3 Latent Upscaler (3D)」**，连入一个 `LATENT`，选择模型、设置 `scale`，再解码即可。
+从 `video/MinimaxH3` 菜单中添加所需节点，连入一个 `LATENT`，选择模型、设置缩放模式/参数，再解码即可。
 
 **典型流程：**
 - **快速预览：** `[Minimax H3 Latent] → [H3 Latent Upscaler] → [VAE 解码]`
@@ -133,7 +153,7 @@ ComfyUI/models/latent_upscale_models/
 
 ⚠️ **省时间，不省显存：** 精修仍在目标分辨率下运行，峰值显存与直接高清生成接近，收益纯粹是更快出片。
 
-### 节点参数
+### 节点参数 — 2D / 3D（经典）
 
 | 参数 | 类型 | 默认值 | 范围 / 选项 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -145,7 +165,49 @@ ComfyUI/models/latent_upscale_models/
 
 **输出：** `LATENT` — 放大后的 latent，可直接送 VAE 解码。
 
-> **2D 还是 3D？** 帧间已较稳定、求快时选 **2D**；需要更强运动/时间一致性时选 **3D**。
+### 节点参数 — Target Resolution（3D，社区）
+
+| 参数 | 类型 | 默认值 | 范围 / 选项 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| `latent` | LATENT | — | — | 输入的 Minimax H3 latent（(B,C,T,H,W) 或 (B,C,H,W)） |
+| `model_name` | 下拉框 | 自动 | 扫描到的文件 | `latent_upscale_models/` 中的模型 |
+| `width` | INT | 768 | ≥ 1 | 目标像素**宽** |
+| `height` | INT | 432 | ≥ 1 | 目标像素**高** |
+| `align` | INT | 16 | 2,4,6,…（步进 2） | latent 网格整除数（8/16/32…），目标 latent 的 H×W 会向上取整到 `align` 的倍数 |
+| `device` | 下拉框 | cuda | cuda / cpu | 推理设备 |
+| `precision` | 下拉框 | fp32 | fp32 / fp16 / bf16 | 推理精度 |
+
+**输出：** `LATENT` — 放大后的 latent。等效倍率由 `width`/`height` 与 `align` 反推得到。
+
+### 节点参数 — Megapixels（3D，社区）
+
+| 参数 | 类型 | 默认值 | 范围 / 选项 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| `latent` | LATENT | — | — | 输入的 Minimax H3 latent（(B,C,T,H,W) 或 (B,C,H,W)） |
+| `model_name` | 下拉框 | 自动 | 扫描到的文件 | `latent_upscale_models/` 中的模型 |
+| `target_megapixels` | FLOAT | 1.2 | 0.1 – 8.0（步进 0.1） | 目标总百万像素，保持宽高比 |
+| `align` | INT | 16 | 2,4,6,…（步进 2） | latent 网格整除数（8/16/32…），目标 latent 的 H×W 会向上取整到 `align` 的倍数 |
+| `device` | 下拉框 | cuda | cuda / cpu | 推理设备 |
+| `precision` | 下拉框 | fp32 | fp32 / fp16 / bf16 | 推理精度 |
+
+**输出：** `LATENT` — 放大后的 latent。等效倍率由计算出的像素尺寸与 `align` 反推得到。
+
+### 节点参数 — Cond Sync（3D，社区）
+
+| 参数 | 类型 | 默认值 | 范围 / 选项 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| `latent` | LATENT | — | — | 输入 latent（通常由上游放大节点产出），**原样透传** |
+| `positive` | CONDITIONING | 可选 | — | 正条件；其中图像引用会被同步 resize 到 latent 当前尺寸 |
+| `negative` | CONDITIONING | 可选 | — | 负条件；其中图像引用会被同步 resize 到 latent 当前尺寸 |
+
+**输出：** `(LATENT, CONDITIONING, CONDITIONING)` — 透传的 latent + 同步后的正/负条件。
+
+> 该节点**不做放大**，仅把 conditioning 同步到 latent 当前分辨率。把它接在某个放大节点之后，
+> 第二阶段精修/重采样就能拿到匹配的尺寸。
+
+> **选哪个节点？** 简单 `1.0×–4.0×` 倍率用 **2D / 3D（倍数）**；明确知道输出 WIDTH×HEIGHT 用
+> **Target Resolution**；「我就想要约 1.2MP」用 **Megapixels**；放大后需要把 `CONDITIONING` 同步
+> resize 给第二阶段精修，用 **Cond Sync**。两个「明确尺寸」节点通过 `h3_upscaler_common.py` 共用同一份模型。
 
 ---
 
