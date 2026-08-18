@@ -12,6 +12,7 @@ import os
 import glob
 import folder_paths
 import re
+import comfy.nested_tensor
 from einops import rearrange
 
 # ==========================================
@@ -435,10 +436,18 @@ class MinimaxH3LatentUpscalerNode2D:
         dev = torch.device(device if torch.cuda.is_available() else "cpu")
         model = load_model(model_name, dev, precision)
 
-        s = latent["samples"].clone()
+        samples = latent["samples"]
+        # AV latent (NestedTensor: 视频 + 音频): 只放大视频流
+        if getattr(samples, "is_nested", False):
+            video_samples, audio_samples = samples.unbind()
+        else:
+            video_samples, audio_samples = samples, None
+
+        s = video_samples.clone()
         orig_dtype = s.dtype
         # 确保是 5D (B, C, T, H, W)
-        if len(s.shape) == 4:
+        was_4d = len(s.shape) == 4
+        if was_4d:
             s = s.unsqueeze(2)  # (B, C, 1, H, W)
 
         compute_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[precision]
@@ -458,7 +467,7 @@ class MinimaxH3LatentUpscalerNode2D:
         out = out * norm_std + norm_mean
 
         # 还原维度
-        if len(latent["samples"].shape) == 4:
+        if was_4d:
             out = out.squeeze(2)
 
         out = out.cpu().to(orig_dtype)
@@ -466,7 +475,13 @@ class MinimaxH3LatentUpscalerNode2D:
         if dev.type == "cuda":
             torch.cuda.empty_cache()
 
-        return ({"samples": out},)
+        # AV latent: 视频放大结果 + 未动的音频流拼回 NestedTensor
+        if audio_samples is not None:
+            out = comfy.nested_tensor.NestedTensor((out, audio_samples))
+
+        result = latent.copy()
+        result["samples"] = out
+        return (result,)
 
 # ==========================================
 # 节点注册
