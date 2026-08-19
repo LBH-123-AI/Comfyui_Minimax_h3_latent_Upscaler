@@ -1,9 +1,10 @@
 """
-Minimax H3 Latent Upscaler - ComfyUI 推理节点 (纯3D卷积版本)
-- 自动检测模型结构 (通道数、块数、Temporal 位置)
-- 支持 FP32 / FP16 / BF16 推理
-- 强制关闭注意力 (attn=False)
-- 模型从 ComfyUI/models/latent_upscale_models/ 加载
+Minimax H3 Latent Upscaler - ComfyUI inference node (pure 3D conv version)
+- New ComfyUI API (comfy_api.latest)
+- 3 resize modes: scale by multiplier / target dimensions / megapixels
+- Pixel-space alignment + aspect-ratio lock (no distortion)
+- Auto-detects model architecture (channels, blocks, temporal layout)
+- FP32 / FP16 / BF16 inference, VRAM-optimized
 """
 import torch
 import torch.nn as nn
@@ -14,9 +15,47 @@ import folder_paths
 import re
 import comfy.nested_tensor
 from einops import rearrange
+from enum import Enum
+from typing import TypedDict
+
+# Try to import the new API
+try:
+    from comfy_api.latest import ComfyExtension, io
+    from typing_extensions import override
+    USE_NEW_API = True
+except ImportError:
+    USE_NEW_API = False
+    # Dummy io module so the file still parses on old ComfyUI versions
+    class io:
+        class ComfyNode: pass
+        class Schema: pass
+        class NodeOutput: pass
+        class AnyType:
+            @staticmethod
+            def Input(*args, **kwargs): return args[0] if args else "ANY"
+            @staticmethod
+            def Output(*args, **kwargs): return args[0] if args else "ANY"
+        class Combo:
+            @staticmethod
+            def Input(*args, **kwargs): return args[0] if args else "COMBO"
+        class Float:
+            @staticmethod
+            def Input(*args, **kwargs): return "FLOAT"
+        class Int:
+            @staticmethod
+            def Input(*args, **kwargs): return "INT"
+        class Boolean:
+            @staticmethod
+            def Input(*args, **kwargs): return "BOOLEAN"
+        class DynamicCombo:
+            @staticmethod
+            def Input(*args, **kwargs): return args[0] if args else "DYNAMIC"
+            class Option: pass
+    class ComfyExtension: pass
+    def override(func): return func
 
 # ==========================================
-# 注册模型文件夹
+# Register model folder
 # ==========================================
 _LATENT_UPSCALE_FOLDER = "latent_upscale_models"
 if _LATENT_UPSCALE_FOLDER not in folder_paths.folder_names_and_paths:
@@ -25,8 +64,12 @@ if _LATENT_UPSCALE_FOLDER not in folder_paths.folder_names_and_paths:
         os.path.join(folder_paths.models_dir, _LATENT_UPSCALE_FOLDER)
     )
 
+# Spatial compression factor of the Minimax H3 3D VAE (16x).
+# Hidden from the UI on purpose: 1280x704 px -> 80x44 latent.
+VAE_DOWNSAMPLE = 16
+
 # ==========================================
-# Minimax H3 归一化参数 (来自训练代码，24通道)
+# Minimax H3 latent normalization stats (24 channels, from training code)
 # ==========================================
 LATENTS_MEAN = [
     0.858090341091156, -0.9606591463088989, 1.0661640167236328, -0.5090325474739075, 
@@ -51,7 +94,7 @@ def _make_norm_tensors(device, dtype):
     return mean, std
 
 # ==========================================
-# 3D 网络组件 (与训练代码一致)
+# 3D network components (identical to training code)
 # ==========================================
 def normalization(channels):
     return nn.GroupNorm(32, channels)
@@ -132,7 +175,7 @@ class TemporalConv(nn.Module):
         return identity + h
 
 # ==========================================
-# 纯3D主干网络 (与训练代码一致)
+# Pure-3D backbone (identical to training code)
 # ==========================================
 class LatentResizer3D(nn.Module):
     def __init__(self, in_channels=24, in_blocks=12, out_blocks=12,
@@ -167,7 +210,6 @@ class LatentResizer3D(nn.Module):
         if target_size is not None:
             size = target_size
         elif scale is not None:
-            # 计算目标大小 (T, H, W)
             size = tuple(int(round(s * scale)) for s in x.shape[-3:])
         else:
             return x
@@ -188,7 +230,6 @@ class LatentResizer3D(nn.Module):
             else:
                 x = b(x)
 
-        # 三线性插值
         x = F.interpolate(x, size=size, mode="trilinear", align_corners=False)
 
         for b in self.out_blocks:
@@ -204,7 +245,7 @@ class LatentResizer3D(nn.Module):
         return x
 
 # ==========================================
-# 模型加载 (纯3D版本)
+# Model loading
 # ==========================================
 MODEL_CACHE = {}
 
@@ -217,7 +258,7 @@ def scan_models():
     for ext in ("*.pth", "*.safetensors"):
         files.extend(glob.glob(os.path.join(model_dir, ext)))
     names = sorted(os.path.basename(f) for f in files)
-    return names if names else [f"(请将模型放入: {model_dir})"]
+    return names if names else [f"(place models in: {model_dir})"]
 
 def _load_raw_sd(path):
     if path.endswith('.safetensors'):
@@ -227,87 +268,51 @@ def _load_raw_sd(path):
         sd = torch.load(path, map_location='cpu', weights_only=False)
     if isinstance(sd, dict) and 'model' in sd:
         sd = sd['model']
-    # 移除可能的前缀 (如果有) 并处理 FP8 格式
     sd = {k: v.to(torch.float16) if v.dtype == torch.float8_e4m3fn else v
           for k, v in sd.items()}
     return sd
 
 def _extract_upscaler_sd(sd):
-    # 兼容之前可能包含 'upscaler.' 前缀的合并权重
     if any(k.startswith("upscaler.") for k in sd):
         return {k[len("upscaler."):]: v for k, v in sd.items() if k.startswith("upscaler.")}
     return sd
 
 def _detect_arch(sd):
-    """
-    从 state_dict 推断模型结构参数。
-    返回: dict 包含 in_blocks, out_blocks, channels, in_channels, dropout, attn, temporal_every, temporal_kernel
-    """
-    # 默认参数与 Minimax H3 训练配置保持一致
     cfg = {
-        "in_channels": 24,
-        "in_blocks": 12,
-        "out_blocks": 12,
-        "channels": 512,
-        "dropout": 0.1,
-        "attn": False,
-        "temporal_every": 2,   
-        "temporal_kernel": 5,
+        "in_channels": 24, "in_blocks": 12, "out_blocks": 12, "channels": 512,
+        "dropout": 0.1, "attn": False, "temporal_every": 2, "temporal_kernel": 5,
     }
-
-    # 检测通道数
     conv_key = 'conv_in.weight'
     if conv_key in sd:
         cfg["in_channels"] = sd[conv_key].shape[1]
         cfg["channels"] = sd[conv_key].shape[0]
 
-    # 检测 in_blocks 和 out_blocks 数量
-    in_ids = set()
-    out_ids = set()
-    temporal_in_indices = set()
-    temporal_out_indices = set()
+    in_ids, out_ids = set(), set()
+    temporal_in_indices, temporal_out_indices = set(), set()
     for k in sd.keys():
-        # 匹配 in_blocks 中的 ResBlock (有 in_layers)
         m = re.match(r'in_blocks\.(\d+)\.in_layers\.', k)
-        if m:
-            in_ids.add(int(m.group(1)))
-        # 匹配 out_blocks 中的 ResBlock
+        if m: in_ids.add(int(m.group(1)))
         m = re.match(r'out_blocks\.(\d+)\.in_layers\.', k)
-        if m:
-            out_ids.add(int(m.group(1)))
-        # 匹配 temporal 层 (dwconv)
+        if m: out_ids.add(int(m.group(1)))
         m = re.match(r'in_blocks\.(\d+)\.dwconv\.weight', k)
-        if m:
-            temporal_in_indices.add(int(m.group(1)))
+        if m: temporal_in_indices.add(int(m.group(1)))
         m = re.match(r'out_blocks\.(\d+)\.dwconv\.weight', k)
-        if m:
-            temporal_out_indices.add(int(m.group(1)))
+        if m: temporal_out_indices.add(int(m.group(1)))
 
-    if in_ids:
-        cfg["in_blocks"] = len(in_ids)
-    if out_ids:
-        cfg["out_blocks"] = len(out_ids)
+    if in_ids: cfg["in_blocks"] = len(in_ids)
+    if out_ids: cfg["out_blocks"] = len(out_ids)
 
-    # 检测 temporal 配置
     if temporal_in_indices or temporal_out_indices:
-        cfg["temporal_every"] = 2  # 训练默认
-        # 尝试从 key 中读取 kernel 大小
+        cfg["temporal_every"] = 2
         for k in sd.keys():
             if 'dwconv.weight' in k and k.endswith('dwconv.weight'):
-                # 读取形状获取 kernel size (维度是 (out, in/groups, T, H, W))
-                kernel_t = sd[k].shape[2]
-                cfg["temporal_kernel"] = kernel_t
+                cfg["temporal_kernel"] = sd[k].shape[2]
                 break
     else:
-        cfg["temporal_every"] = 0  # 无 temporal
+        cfg["temporal_every"] = 0
 
-    # 检测 attn (如果存在 attn 层键)
-    if any('attn' in k for k in sd):
-        cfg["attn"] = True 
-
-    # 推理时为了性能和稳定性，强制 attn=False
-    cfg["attn"] = False
-
+    if any('attn' in k for k in sd): cfg["attn"] = True 
+    cfg["attn"] = False  # force off at inference for speed/stability
     return cfg
 
 def load_model(name, device, precision):
@@ -317,71 +322,105 @@ def load_model(name, device, precision):
 
     path = os.path.join(get_models_dir(), name)
     if not os.path.exists(path):
-        raise FileNotFoundError(f"模型文件不存在: {path}")
+        raise FileNotFoundError(f"Model file not found: {path}")
 
     raw_sd = _load_raw_sd(path)
     up_sd = _extract_upscaler_sd(raw_sd)
-
     cfg = _detect_arch(up_sd)
 
-    # 构建模型
     model = LatentResizer3D(
-        in_channels=cfg["in_channels"],
-        in_blocks=cfg["in_blocks"],
-        out_blocks=cfg["out_blocks"],
-        channels=cfg["channels"],
-        dropout=cfg["dropout"],
-        attn=cfg["attn"],           # 强制 False
-        temporal_every=cfg["temporal_every"],
-        temporal_kernel=cfg["temporal_kernel"],
+        in_channels=cfg["in_channels"], in_blocks=cfg["in_blocks"], out_blocks=cfg["out_blocks"],
+        channels=cfg["channels"], dropout=cfg["dropout"], attn=cfg["attn"],
+        temporal_every=cfg["temporal_every"], temporal_kernel=cfg["temporal_kernel"],
     )
-    model.load_state_dict(up_sd, strict=True)  # 严格匹配，确保结构一致
+    model.load_state_dict(up_sd, strict=True)
     dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(precision, torch.float32)
-    model = model.to(device).eval()
+    model = model.to(device).eval().requires_grad_(False)
     if dtype != torch.float32:
         model = model.to(dtype)
 
     MODEL_CACHE[cache_key] = model
-
-    print(f"[MinimaxH3-3D] 加载放大模型: {name}")
+    print(f"[MinimaxH3-3D] Loaded upscale model: {name}")
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,} | "
-          f"Attn: 强制关闭 | Temporal: {'✓' if cfg['temporal_every']>0 else '✗'} "
-          f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']})")
+          f"Attn: forced off | Temporal: {'on' if cfg['temporal_every'] > 0 else 'off'} "
+          f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']}) | "
+          f"Precision: {precision}")
     return model
 
 # ==========================================
-# ComfyUI 节点
+# ComfyUI node (new API)
 # ==========================================
-class MinimaxH3LatentUpscalerNode3D:
-    """Minimax H3 Latent 放大节点 (纯3D卷积，scale 1.0~4.0)"""
+class UpscaleMode(str, Enum):
+    SCALE_BY = "scale by multiplier"
+    TARGET_DIMENSIONS = "target dimensions"
+    MEGAPIXELS = "megapixels"
+
+class UpscaleConfig(TypedDict):
+    mode: UpscaleMode
+    scale: float
+    width: int
+    height: int
+    megapixels: float
+
+class MinimaxH3LatentUpscaler3D(io.ComfyNode):
+    """Minimax H3 latent upscaler with pixel-space alignment and aspect-ratio lock."""
+
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "latent": ("LATENT",),
-                "model_name": (scan_models(),),
-                "scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.1}),
-                "device": (["cuda", "cpu"], {"default": "cuda"}),
-                "precision": (["fp32", "fp16", "bf16"], {"default": "fp32"}),
-            }
-        }
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MinimaxH3LatentUpscaler3D",
+            display_name="Minimax H3 Latent Upscaler (3D)",
+            category="video/MinimaxH3",
+            search_aliases=["minimax", "h3", "latent", "upscale", "3d"],
+            inputs=[
+                io.AnyType.Input("latent", tooltip="Input latent (image or video)."),
+                io.Combo.Input("model_name", options=scan_models(), tooltip="Minimax H3 upscale model."),
 
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "run"
-    CATEGORY = "video/MinimaxH3"
+                io.DynamicCombo.Input(
+                    "mode",
+                    tooltip="How the target size is computed.",
+                    options=[
+                        io.DynamicCombo.Option(UpscaleMode.SCALE_BY, [
+                            io.Float.Input("scale", default=2.0, min=1.0, max=4.0, step=0.05, tooltip="Upscale factor."),
+                        ]),
+                        io.DynamicCombo.Option(UpscaleMode.TARGET_DIMENSIONS, [
+                            io.Int.Input("width", default=1280, min=64, max=4096, step=8, tooltip="Target pixel width."),
+                            io.Int.Input("height", default=704, min=64, max=4096, step=8, tooltip="Target pixel height.")
+                        ]),
+                        io.DynamicCombo.Option(UpscaleMode.MEGAPIXELS, [
+                            io.Float.Input("megapixels", default=1.0, min=0.1, max=8.0, step=0.1, tooltip="Target megapixels (1024x1024 = 1MP).")
+                        ])
+                    ],
+                ),
 
-    def run(self, latent, model_name, scale, device, precision):
+                io.Int.Input("align", default=32, min=1, max=512, step=1,
+                             tooltip="Pixel-space alignment: output W/H are rounded to multiples of this value (e.g. 16/32/64)."),
+                io.Boolean.Input("keep_proportion", default=True,
+                                 tooltip="Lock the original aspect ratio; height is derived from the aligned width to avoid distortion."),
+
+                io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
+                io.Combo.Input("precision", options=["fp32", "fp16", "bf16"], default="fp16"),
+            ],
+            outputs=[
+                io.AnyType.Output("latent", tooltip="Upscaled latent."),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, latent: dict, model_name: str, mode: UpscaleConfig,
+                align: int, keep_proportion: bool,
+                device: str, precision: str) -> io.NodeOutput:
+
         if model_name.startswith('('):
-            raise ValueError("请将模型文件放入 latent_upscale_models 目录")
+            raise ValueError("Please place model files into the latent_upscale_models directory")
 
-        if abs(scale - 1.0) < 1e-6:
-            return (latent,)
+        selected_mode = mode["mode"]
+        src = latent["samples"]
+        orig_dtype = src.dtype
+        was_4d = (src.dim() == 4)
 
-        if scale < 1.0:
-            raise ValueError("仅支持放大 (scale >= 1.0)")
-
-        dev = torch.device(device if torch.cuda.is_available() else "cpu")
-        model = load_model(model_name, dev, precision)
+        dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
+        compute_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[precision]
 
         samples = latent["samples"]
         # AV latent (NestedTensor: 视频 + 音频): 只放大视频流
@@ -390,34 +429,79 @@ class MinimaxH3LatentUpscalerNode3D:
         else:
             video_samples, audio_samples = samples, None
 
-        s = video_samples.clone()
+        s = src.to(device=dev, dtype=compute_dtype, copy=True)
         orig_dtype = s.dtype
         # 确保是 5D (B, C, T, H, W)
         was_4d = len(s.shape) == 4
         if was_4d:
             s = s.unsqueeze(2)  # (B, C, 1, H, W)
 
-        compute_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[precision]
-        s = s.to(dev, compute_dtype)
+        b, c, t, h_in, w_in = s.shape
+        downsample = VAE_DOWNSAMPLE
 
-        # 归一化
+        # 1. Theoretical target size in PIXEL space
+        if selected_mode == UpscaleMode.SCALE_BY:
+            scale_val = mode["scale"]
+            w_pixel_target = w_in * downsample * scale_val
+            h_pixel_target = h_in * downsample * scale_val
+            effective_scale = scale_val
+        elif selected_mode == UpscaleMode.TARGET_DIMENSIONS:
+            w_pixel_target = float(mode["width"])
+            h_pixel_target = float(mode["height"])
+            effective_scale = (w_pixel_target / (w_in * downsample) + h_pixel_target / (h_in * downsample)) / 2.0
+        elif selected_mode == UpscaleMode.MEGAPIXELS:
+            mp = mode["megapixels"]
+            target_pixels = mp * 1024 * 1024
+            aspect_ratio = w_in / h_in
+            h_pixel_target = (target_pixels / aspect_ratio) ** 0.5
+            w_pixel_target = h_pixel_target * aspect_ratio
+            effective_scale = (w_pixel_target / (w_in * downsample) + h_pixel_target / (h_in * downsample)) / 2.0
+        else:
+            raise ValueError(f"Unsupported mode: {selected_mode}")
+
+        # 2. Pixel-space alignment
+        alignment = max(1, align)
+        if keep_proportion:
+            # Width drives the alignment; height follows the aspect ratio exactly.
+            w_pixel_aligned = round(w_pixel_target / alignment) * alignment
+            h_pixel_aligned = w_pixel_aligned / (w_in / h_in)
+        else:
+            w_pixel_aligned = round(w_pixel_target / alignment) * alignment
+            h_pixel_aligned = round(h_pixel_target / alignment) * alignment
+
+        # 3. Snap to VAE grid so latent sizes are exact integers
+        w_pixel_final = round(w_pixel_aligned / downsample) * downsample
+        h_pixel_final = round(h_pixel_aligned / downsample) * downsample
+
+        # 4. Back to LATENT space
+        w_out = max(1, int(w_pixel_final // downsample))
+        h_out = max(1, int(h_pixel_final // downsample))
+
+        if effective_scale < 1.0 and (w_out < w_in or h_out < h_in):
+            raise ValueError("This model only supports upscaling (effective scale >= 1.0).")
+
+        if w_out == w_in and h_out == h_in:
+            return io.NodeOutput(latent)
+
+        print(f"[MinimaxH3-3D] Latent {w_in}x{h_in} -> {w_out}x{h_out} | "
+              f"Pixels {w_out * downsample}x{h_out * downsample} | scale={effective_scale:.3f}")
+
+        # 5. Inference
+        model = load_model(model_name, dev, precision)
         norm_mean, norm_std = _make_norm_tensors(dev, compute_dtype)
-        s = (s - norm_mean) / norm_std
 
-        with torch.no_grad():
-            # 计算目标尺寸 (T, H, W)
-            T, H, W = s.shape[2], s.shape[3], s.shape[4]
-            target_size = (T, int(round(H * scale)), int(round(W * scale)))
-            out = model(s, scale=scale, target_size=target_size)
+        with torch.inference_mode():
+            # In-place normalization: no intermediate tensors allocated.
+            s.sub_(norm_mean).div_(norm_std)
+            out = model(s, scale=effective_scale, target_size=(t, h_out, w_out))
+            del s  # free the normalized input before denormalizing the output
+            out.mul_(norm_std).add_(norm_mean)
 
-        # 反归一化
-        out = out * norm_std + norm_mean
-
-        # 还原维度
         if was_4d:
             out = out.squeeze(2)
 
-        out = out.cpu().to(orig_dtype)
+        # Single fused device+dtype transfer back to CPU, GPU tensor freed right after.
+        out = out.to(device="cpu", dtype=orig_dtype)
 
         if dev.type == "cuda":
             torch.cuda.empty_cache()
@@ -431,11 +515,34 @@ class MinimaxH3LatentUpscalerNode3D:
         return (result,)
 
 # ==========================================
-# 节点注册
+# New-API extension registration
 # ==========================================
+if USE_NEW_API:
+    class MinimaxH3Extension(ComfyExtension):
+        @override
+        async def get_node_list(self) -> list[type[io.ComfyNode]]:
+            return [MinimaxH3LatentUpscaler3D]
+
+    async def comfy_entrypoint() -> MinimaxH3Extension:
+        return MinimaxH3Extension()
+
+# ==========================================
+# Registration (both APIs)
+# ==========================================
+# Legacy mappings: ALWAYS defined so any loader version can pick up the node.
 NODE_CLASS_MAPPINGS = {
-    "MinimaxH3LatentUpscalerNode3D": MinimaxH3LatentUpscalerNode3D,
+    "MinimaxH3LatentUpscaler3D": MinimaxH3LatentUpscaler3D,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "MinimaxH3LatentUpscalerNode3D": "Minimax H3 Latent Upscaler (3D)",
+    "MinimaxH3LatentUpscaler3D": "Minimax H3 Latent Upscaler (3D)",
 }
+
+# New-style extension entrypoint (only when the new API exists).
+if USE_NEW_API:
+    class MinimaxH3Extension(ComfyExtension):
+        @override
+        async def get_node_list(self) -> list[type[io.ComfyNode]]:
+            return [MinimaxH3LatentUpscaler3D]
+
+    async def comfy_entrypoint() -> MinimaxH3Extension:
+        return MinimaxH3Extension()
