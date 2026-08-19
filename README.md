@@ -12,6 +12,12 @@ Learned · High-fidelity · 2D & 3D Variants
 
 </div>
 
+## 📰 News
+
+- [2026-08-19] 🚀 **3D node overhaul**: all three resize modes (`scale by multiplier`, `target dimensions`, `megapixels`) merged into a single node; fixed aspect-ratio mismatch in certain modes and edge artifacts at specific sizes; added a new example workflow and expanded the usage notes.
+- [2026-08-18] 🔥 **Precision selector**: both 2D and 3D nodes now support `fp32` / `fp16` / `bf16` inference.
+- [2026-08-17] 🎉 **Initial release**: Minimax H3 Latent Upscaler 2D + 3D nodes with bilingual README and inline examples.
+
 A custom ComfyUI node that upscales **Minimax H3** VAE latents (24 channels) with a trained
 neural network instead of naive interpolation. Its main purpose is to **accelerate
 high-resolution video generation** and improve quality:
