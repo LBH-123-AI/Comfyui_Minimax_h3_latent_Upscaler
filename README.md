@@ -14,6 +14,7 @@ Learned · High-fidelity · 2D & 3D Variants
 
 ## 📰 News
 
+- [2026-08-21] 🚀 **3D node optimization**: The model is automatically offloaded to CPU after execution to free VRAM for subsequent second-pass sampling; width and height are independently aligned to the align grid (default 32), fixing the bottom light band issue; normalization/denormalization is changed from in-place operations to standard operations; temporal chunking is retained to support long videos.
 - [2026-08-19] 🚀 **3D node overhaul**: all three resize modes (`scale by multiplier`, `target dimensions`, `megapixels`) merged into a single node; fixed aspect-ratio mismatch in certain modes and edge artifacts at specific sizes; added a new example workflow and expanded the usage notes.
 - [2026-08-18] 🔥 **Precision selector**: both 2D and 3D nodes now support `fp32` / `fp16` / `bf16` inference.
 - [2026-08-17] 🎉 **Initial release**: Minimax H3 Latent Upscaler 2D + 3D nodes with bilingual README and inline examples.
@@ -189,10 +190,9 @@ roughly the same as generating high-res directly. The benefit is purely faster t
 | `width` | INT | 1280 | 64 – 4096 (step 8) | Target pixel width (used by `target dimensions`) |
 | `height` | INT | 704 | 64 – 4096 (step 8) | Target pixel height (used by `target dimensions`) |
 | `megapixels` | FLOAT | 1.0 | 0.1 – 8.0 (step 0.1) | Target total megapixels (used by `megapixels`); keeps aspect ratio |
-| `align` | INT | 32 | 1 – 512 | Pixel-grid alignment: output W/H are rounded to multiples of this value (e.g. 16/32/64) |
-| `keep_proportion` | BOOLEAN | True | True / False | Lock the original aspect ratio when `mode` is `target dimensions` or `megapixels` |
+| `align` | INT | 32 | 1 – 512 | Pixel-grid alignment: output W/H are independently rounded to multiples of this value (e.g. 16/32/64) |
 | `device` | dropdown | cuda | cuda / cpu | Inference device |
-| `precision` | dropdown | fp16 | fp32 / fp16 / bf16 | Inference precision |
+| `precision` | dropdown | fp32 | fp32 / fp16 / bf16 | Inference precision |
 
 **Output:** `LATENT` — the upscaled latent.
 
