@@ -1,10 +1,11 @@
 """
 Minimax H3 Latent Upscaler - ComfyUI inference node (pure 3D conv version)
-- [终极整合] 引入时间分块(Temporal Chunking)解决长视频显存峰值
+- [终极整合] 引入时间分块(Temporal Chunking)开关，解决长视频显存峰值
+- [终极整合] 修复分块边缘效应(Replicate Padding)，彻底解决末尾帧闪烁
 - [终极整合] 推理结束后将模型踢回CPU，释放显存给后续节点(解决二次采样爆显存/速度慢)
 - [终极整合] 强制长宽双向对齐到32的倍数，彻底解决底部光带(Light Banding)问题
 - [终极整合] 放弃 In-place 原地操作，保障 FP16/FP32 下的数值精度与画质
-- [精简优化] 移除鸡肋的 keep_proportion 功能，简化尺寸计算逻辑
+- [新增] 完美支持 ROCm (AMD GPU) 加速
 - 3 resize modes: scale by multiplier / target dimensions / megapixels
 - Auto-detects model architecture (channels, blocks, temporal layout)
 """
@@ -26,7 +27,6 @@ try:
     USE_NEW_API = True
 except ImportError:
     USE_NEW_API = False
-    # Dummy io module so the file still parses on old ComfyUI versions
     class io:
         class ComfyNode: pass
         class Schema: pass
@@ -65,7 +65,6 @@ if _LATENT_UPSCALE_FOLDER not in folder_paths.folder_names_and_paths:
         os.path.join(folder_paths.models_dir, _LATENT_UPSCALE_FOLDER)
     )
 
-# Spatial compression factor of the Minimax H3 3D VAE (16x).
 VAE_DOWNSAMPLE = 16
 
 # ==========================================
@@ -92,6 +91,34 @@ def _make_norm_tensors(device, dtype):
     mean = torch.tensor(LATENTS_MEAN, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
     std = torch.tensor(LATENTS_STD, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
     return mean, std
+
+# ==========================================
+# ROCm / Device Helper Functions
+# ==========================================
+def _is_rocm_build():
+    """ROCm PyTorch exposes AMD GPUs through the torch.cuda API."""
+    return getattr(torch.version, "hip", None) is not None
+
+def _resolve_device(backend):
+    """Map the user-facing backend name to the device expected by PyTorch."""
+    if backend == "cpu":
+        return torch.device("cpu")
+    if backend == "rocm":
+        if not _is_rocm_build():
+            raise RuntimeError("ROCm was selected, but this PyTorch build has no HIP/ROCm support. Install a ROCm build of PyTorch.")
+        if not torch.cuda.is_available():
+            raise RuntimeError("ROCm was selected, but PyTorch cannot access an AMD GPU. Check drivers and permissions.")
+        return torch.device("cuda") # PyTorch uses 'cuda' device type for ROCm
+    if backend == "cuda":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    raise ValueError(f"Unsupported device backend: {backend}")
+
+def _backend_label(device):
+    if device.type == "cuda" and _is_rocm_build():
+        return f"ROCm/HIP {torch.version.hip}"
+    if device.type == "cuda":
+        return f"CUDA {getattr(torch.version, 'cuda', None) or 'unknown'}"
+    return "CPU"
 
 # ==========================================
 # 3D network components 
@@ -175,7 +202,7 @@ class TemporalConv(nn.Module):
         return identity + h
 
 # ==========================================
-# Pure-3D backbone with Temporal Chunking
+# Pure-3D backbone with Temporal Chunking Switch
 # ==========================================
 class LatentResizer3D(nn.Module):
     def __init__(self, in_channels=24, in_blocks=12, out_blocks=12,
@@ -206,7 +233,7 @@ class LatentResizer3D(nn.Module):
         self.norm_out = normalization(channels)
         self.conv_out = nn.Conv3d(channels, in_channels, 3, padding=1)
 
-    def forward(self, x, scale=None, target_size=None):
+    def forward(self, x, scale=None, target_size=None, enable_chunking=True):
         if target_size is not None:
             size = target_size
         elif scale is not None:
@@ -219,30 +246,72 @@ class LatentResizer3D(nn.Module):
 
         B, C, T, H, W = x.shape
         
-        # [优化] 时间分块 (Temporal Chunking) 防止长视频爆显存
         tk = 0
         for b in self.in_blocks:
             if isinstance(b, TemporalConv):
                 tk = b.dwconv.weight.shape[2]
                 break
-        overlap = tk // 2
-        chunk = 16
-        if T <= chunk:
+        
+        overlap = tk  # 重叠帧数
+        chunk = 24    # 每个分块的有效帧数
+        
+        if not enable_chunking or T <= chunk:
             return self._forward_seg(x, scale, size)
 
         print(f"[MinimaxH3-3D] temporal chunking: T={T} chunks={(T + chunk - 1) // chunk} overlap={overlap}")
-        outs = []
+        
+        x_padded = F.pad(x, (0, 0, 0, 0, overlap, overlap), mode='replicate')
+        
+        out_full = torch.zeros(B, C, T, size[-2], size[-1], device=x.device, dtype=x.dtype)
+        weight_full = torch.zeros(1, 1, T, 1, 1, device=x.device, dtype=x.dtype)
+        
         start = 0
         while start < T:
-            lo = max(0, start - overlap)
-            hi = min(T, start + chunk + overlap)
-            seg = x[:, :, lo:hi]
+            seg_start = start
+            seg_end = min(T, start + chunk)
+            
+            # 【核心修复】输出范围包括重叠区域，确保分块之间有重叠
+            out_start = max(0, seg_start - overlap)
+            out_end = min(T, seg_end + overlap)
+            
+            # 在 padded 张量上的切片索引（需要额外的上下文）
+            lo = max(0, out_start - overlap)
+            hi = min(T + 2 * overlap, out_end + overlap)
+            
+            seg = x_padded[:, :, lo:hi]
             seg_size = (hi - lo, size[-2], size[-1])
             seg_out = self._forward_seg(seg, scale, seg_size)
-            s0 = start - lo
-            s1 = s0 + min(chunk, T - start)
-            outs.append(seg_out[:, :, s0:s1])
+            
+            # 计算 seg_out 中对应 [out_start, out_end) 的索引
+            s0 = (out_start + overlap) - lo
+            s1 = s0 + (out_end - out_start)
+            
+            valid_out = seg_out[:, :, s0:s1]
+            n_valid = out_end - out_start
+            
+            # 【核心修复】创建正确的权重：有效区域权重为 1，重叠区域权重渐变
+            weight = torch.ones(n_valid, device=x.device, dtype=x.dtype)
+            
+            # 在 [out_start, seg_start) 区域（前重叠区域），权重从 0 递增到 1
+            if seg_start > out_start:
+                blend_len = seg_start - out_start
+                weight[:blend_len] = torch.arange(1, blend_len + 1, device=x.device, dtype=x.dtype) / (blend_len + 1)
+            
+            # 在 [seg_end, out_end) 区域（后重叠区域），权重从 1 递减到 0
+            if out_end > seg_end:
+                blend_len = out_end - seg_end
+                weight[-blend_len:] = torch.arange(blend_len, 0, -1, device=x.device, dtype=x.dtype) / (blend_len + 1)
+            
+            # 累加加权后的分块输出
+            out_full[:, :, out_start:out_end] += valid_out * weight.view(1, 1, n_valid, 1, 1)
+            weight_full[:, :, out_start:out_end] += weight.view(1, 1, n_valid, 1, 1)
+            
             start += chunk
+        
+        # 归一化
+        out_full = out_full / weight_full.clamp(min=1e-8)
+        return out_full
+            
         return torch.cat(outs, dim=2)
 
     def _forward_seg(self, x, scale, size):
@@ -345,10 +414,10 @@ def _detect_arch(sd):
     return cfg
 
 def load_model(name, device, precision):
-    cache_key = f"{name}::{device}::{precision}"
+    backend_lbl = _backend_label(device)
+    cache_key = f"{name}::{backend_lbl}::{precision}"
     if cache_key in MODEL_CACHE:
         model = MODEL_CACHE[cache_key]
-        # [优化] 确保从缓存取出的模型被移到正确的计算设备上 (因为执行完会被踢回CPU)
         print(f"[MinimaxH3-3D] 🔄 Loading model from cache to {device}")
         return model.to(device)
 
@@ -376,7 +445,7 @@ def load_model(name, device, precision):
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,} | "
           f"Attn: forced off | Temporal: {'on' if cfg['temporal_every'] > 0 else 'off'} "
           f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']}) | "
-          f"Precision: {precision}")
+          f"Backend: {backend_lbl} | Precision: {precision}")
     return model
 
 # ==========================================
@@ -428,10 +497,11 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
                 io.Int.Input("align", default=32, min=1, max=512, step=1,
                              tooltip="Pixel-space alignment: output W/H are rounded to multiples of this value (e.g. 16/32/64). 32 is strictly recommended to avoid light banding."),
                 
-                # [精简] 移除了 keep_proportion，直接强制长宽双向对齐
+                io.Boolean.Input("enable_chunking", default=True,
+                                 tooltip="Enable temporal chunking to save VRAM for long videos. Turn off for short videos (<16 frames) for pure full-context inference."),
                 
-                io.Combo.Input("device", options=["cuda", "cpu"], default="cuda"),
-                # [优化] 默认精度改回 fp32，保障 3D 卷积的最佳性能与画质
+                io.Combo.Input("device", options=["cuda", "rocm", "cpu"], default="cuda", 
+                               tooltip="Execution backend. ROCm requires a HIP-enabled PyTorch build."),
                 io.Combo.Input("precision", options=["fp32", "fp16", "bf16"], default="fp16"), 
             ],
             outputs=[
@@ -441,7 +511,7 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
 
     @classmethod
     def execute(cls, latent: dict, model_name: str, mode: UpscaleConfig,
-                align: int, device: str, precision: str) -> io.NodeOutput:
+                align: int, enable_chunking: bool, device: str, precision: str) -> io.NodeOutput:
 
         if model_name.startswith('('):
             raise ValueError("Please place model files into the latent_upscale_models directory")
@@ -451,7 +521,7 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
         orig_dtype = src.dtype
         was_4d = (src.dim() == 4)
 
-        dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
+        dev = _resolve_device(device)
         compute_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[precision]
 
         s = src.to(device=dev, dtype=compute_dtype).clone()
@@ -508,9 +578,10 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
         norm_mean, norm_std = _make_norm_tensors(dev, compute_dtype)
 
         with torch.inference_mode():
-            # [优化] 放弃 in-place 操作，改回标准运算，保障精度与画质
+            # 放弃 in-place 操作，保障精度与画质
             s_norm = (s - norm_mean) / norm_std
-            out = model(s_norm, scale=effective_scale, target_size=(t, h_out, w_out))
+            # 传递 enable_chunking 参数
+            out = model(s_norm, scale=effective_scale, target_size=(t, h_out, w_out), enable_chunking=enable_chunking)
             del s_norm
             out = out * norm_std + norm_mean
 
@@ -519,7 +590,7 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
 
         out = out.to(device="cpu", dtype=orig_dtype)
 
-        # [优化] 推理结束后将模型踢回 CPU，释放显存给后续节点 (如 KSampler)
+        # 推理结束后将模型踢回 CPU，释放显存给后续节点 (如 KSampler)
         if dev.type == "cuda":
             model.to("cpu")
             torch.cuda.empty_cache()
@@ -548,12 +619,3 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MinimaxH3LatentUpscaler3D": "Minimax H3 Latent Upscaler (3D)",
 }
-
-if USE_NEW_API:
-    class MinimaxH3Extension(ComfyExtension):
-        @override
-        async def get_node_list(self) -> list[type[io.ComfyNode]]:
-            return [MinimaxH3LatentUpscaler3D]
-
-    async def comfy_entrypoint() -> MinimaxH3Extension:
-        return MinimaxH3Extension()
