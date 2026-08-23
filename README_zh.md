@@ -14,6 +14,7 @@
 
 ## 📰 更新动态
 
+- [2026-08-23] 🚀 **3D 节点改进**：新增 `enable_chunking` 开关（短片段可关闭，使用全上下文推理）；修复时间分块边缘伪影——采用 Replicate Padding 与重叠区域加权融合，消除末尾帧闪烁；新增 ROCm（AMD 显卡）后端支持，设备选项新增 `rocm`。
 - [2026-08-21] 🚀 **3D 节点优化**：节点执行后自动将模型卸载到 CPU，为后续二次采样释放显存；宽高分别独立对齐到 `align` 网格（默认 32），修复底部光带问题；归一化/反归一化由原地操作改为标准运算，保留时间分块以支持长视频。
 - [2026-08-19] 🚀 **3D 节点重构**：三种缩放模式（`scale by multiplier`、`target dimensions`、`megapixels`）合并进单一节点；修复特定模式下造成的比例不统一，修复各类特定尺寸造成的边缘伪影；新增示例工作流供参考。
 - [2026-08-18] 🔥 **精度选择**：2D / 3D 节点均支持 `fp32` / `fp16` / `bf16` 推理。
@@ -173,7 +174,8 @@ ComfyUI/models/latent_upscale_models/
 | `height` | INT | 704 | 64 – 4096（步进 8） | 目标像素高（`target dimensions` 使用） |
 | `megapixels` | FLOAT | 1.0 | 0.1 – 8.0（步进 0.1） | 目标总百万像素（`megapixels` 使用），保持宽高比 |
 | `align` | INT | 32 | 1 – 512 | 像素网格对齐：输出 W/H 会分别独立取整到该值的倍数（如 16/32/64） |
-| `device` | 下拉框 | cuda | cuda / cpu | 推理设备 |
+| `enable_chunking` | BOOLEAN | True | True / False | 长视频时间分块以压低显存峰值；短片段（<16 帧）可关闭，使用全上下文推理 |
+| `device` | 下拉框 | cuda | cuda / rocm / cpu | 推理后端（ROCm 需要支持 HIP 的 PyTorch 构建） |
 | `precision` | 下拉框 | fp32 | fp32 / fp16 / bf16 | 推理精度 |
 
 **输出：** `LATENT` — 放大后的 latent。
