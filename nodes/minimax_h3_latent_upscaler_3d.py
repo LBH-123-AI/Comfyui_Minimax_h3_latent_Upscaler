@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
-import glob
 import folder_paths
 import re
 from einops import rearrange
@@ -351,11 +350,11 @@ def get_models_dir():
     return folder_paths.get_folder_paths(_LATENT_UPSCALE_FOLDER)[0]
 
 def scan_models():
-    files = []
     model_dir = get_models_dir()
-    for ext in ("*.pth", "*.safetensors"):
-        files.extend(glob.glob(os.path.join(model_dir, ext)))
-    names = sorted(os.path.basename(f) for f in files)
+    names = [
+        name for name in folder_paths.get_filename_list(_LATENT_UPSCALE_FOLDER)
+        if os.path.splitext(name)[1].lower() in (".pth", ".safetensors")
+    ]
     return names if names else [f"(place models in: {model_dir})"]
 
 def _load_raw_sd(path):
@@ -421,9 +420,7 @@ def load_model(name, device, precision):
         print(f"[MinimaxH3-3D] 🔄 Loading model from cache to {device}")
         return model.to(device)
 
-    path = os.path.join(get_models_dir(), name)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Model file not found: {path}")
+    path = folder_paths.get_full_path_or_raise(_LATENT_UPSCALE_FOLDER, name)
 
     raw_sd = _load_raw_sd(path)
     up_sd = _extract_upscaler_sd(raw_sd)
