@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
-import glob
 import folder_paths
 import re
 from einops import rearrange
@@ -347,16 +346,32 @@ class LatentResizer3D(nn.Module):
 # ==========================================
 MODEL_CACHE = {}
 
-def get_models_dir():
-    return folder_paths.get_folder_paths(_LATENT_UPSCALE_FOLDER)[0]
+def get_models_dirs():
+    """Return every ComfyUI path registered for latent upscaler models."""
+    return folder_paths.get_folder_paths(_LATENT_UPSCALE_FOLDER)
 
 def scan_models():
-    files = []
-    model_dir = get_models_dir()
-    for ext in ("*.pth", "*.safetensors"):
-        files.extend(glob.glob(os.path.join(model_dir, ext)))
-    names = sorted(os.path.basename(f) for f in files)
-    return names if names else [f"(place models in: {model_dir})"]
+    """Use ComfyUI's model discovery so extra_model_paths.yaml is honored."""
+    names = [
+        name
+        for name in folder_paths.get_filename_list(_LATENT_UPSCALE_FOLDER)
+        if os.path.splitext(name)[1].lower() in {".pth", ".safetensors"}
+    ]
+    if names:
+        return names
+
+    model_dirs = "; ".join(get_models_dirs())
+    return [f"(no models found in registered latent_upscale_models paths: {model_dirs})"]
+
+def resolve_model_path(name):
+    """Resolve a model name against all registered ComfyUI model paths."""
+    path = folder_paths.get_full_path(_LATENT_UPSCALE_FOLDER, name)
+    if path is None:
+        searched = "; ".join(get_models_dirs())
+        raise FileNotFoundError(
+            f"Model file not found: {name}. Searched: {searched}"
+        )
+    return path
 
 def _load_raw_sd(path):
     if path.endswith('.safetensors'):
@@ -421,9 +436,7 @@ def load_model(name, device, precision):
         print(f"[MinimaxH3-3D] 🔄 Loading model from cache to {device}")
         return model.to(device)
 
-    path = os.path.join(get_models_dir(), name)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Model file not found: {path}")
+    path = resolve_model_path(name)
 
     raw_sd = _load_raw_sd(path)
     up_sd = _extract_upscaler_sd(raw_sd)
