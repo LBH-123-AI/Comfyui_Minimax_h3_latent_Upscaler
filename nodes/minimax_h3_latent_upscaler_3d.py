@@ -1,11 +1,15 @@
 """
 Minimax H3 Latent Upscaler - ComfyUI inference node (pure 3D conv version)
-- [终极整合] 引入时间分块(Temporal Chunking)开关，解决长视频显存峰值
-- [终极整合] 修复分块边缘效应(Replicate Padding)，彻底解决末尾帧闪烁
-- [终极整合] 推理结束后将模型踢回CPU，释放显存给后续节点(解决二次采样爆显存/速度慢)
+- [终极融合] 引入时间分块(Temporal Chunking)与 Replicate Padding，解决长视频 OOM 与末尾闪烁
+- [底层黑科技] 显式 .contiguous() 消除隐式显存拷贝尖峰
+- [底层黑科技] Zero-Copy 零拷贝加载模型，防止系统内存(RAM)峰值爆满
+- [底层黑科技] 接入 ComfyUI 原生 soft_empty_cache，彻底清理显存碎片
+- [终极整合] 推理结束后将模型踢回CPU，释放显存给后续节点(可选开关)
 - [终极整合] 强制长宽双向对齐到32的倍数，彻底解决底部光带(Light Banding)问题
 - [终极整合] 放弃 In-place 原地操作，保障 FP16/FP32 下的数值精度与画质
 - [新增] 完美支持 ROCm (AMD GPU) 加速
+- [新增] 支持子文件夹模型管理 (PR #30)
+- [新增] 强制卸载模型开关 (force_unload)
 - 3 resize modes: scale by multiplier / target dimensions / megapixels
 - Auto-detects model architecture (channels, blocks, temporal layout)
 """
@@ -14,13 +18,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import glob
+import gc
 import folder_paths
 import re
 from einops import rearrange
 from enum import Enum
 from typing import TypedDict
 
-# Try to import the new API
+try:
+    import comfy.model_management as mm
+    HAS_COMFY_MM = True
+except ImportError:
+    HAS_COMFY_MM = False
+
 try:
     from comfy_api.latest import ComfyExtension, io
     from typing_extensions import override
@@ -71,19 +81,19 @@ VAE_DOWNSAMPLE = 16
 # Minimax H3 latent normalization stats (24 channels)
 # ==========================================
 LATENTS_MEAN = [
-    0.858090341091156, -0.9606591463088989, 1.0661640167236328, -0.5090325474739075, 
-    -0.2727581858634949, -1.3675414323806763, -0.2553254961967468, -0.26907554268836975, 
-    -0.5376840829849243, -0.0464097298681736, 0.6657370328903198, 0.19690127670764923, 
-    -0.5460608005523682, -0.4035342037677765, -0.23683024942874908, 0.25928452610969543, 
-    -0.30133944749832153, 0.211341992020607, -1.1206848621368408, 0.3581933379173279, 
+    0.858090341091156, -0.9606591463088989, 1.0661640167236328, -0.5090325474739075,
+    -0.2727581858634949, -1.3675414323806763, -0.2553254961967468, -0.26907554268836975,
+    -0.5376840829849243, -0.0464097298681736, 0.6657370328903198, 0.19690127670764923,
+    -0.5460608005523682, -0.4035342037677765, -0.23683024942874908, 0.25928452610969543,
+    -0.30133944749832153, 0.211341992020607, -1.1206848621368408, 0.3581933379173279,
     -0.04225143790245056, 0.2604829967021942, 0.22864092886447906, 0.7056031823158264
 ]
-LATENTS_STD  = [
-    1.2223774194717407, 1.2767263650894165, 1.6831774711608887, 1.7549455165863037, 
-    1.5636216402053833, 2.194143533706665, 0.9653137922286987, 1.0569885969161987, 
-    0.841948926448822, 0.7729952931404114, 1.8955937623977661, 0.946841835975647, 
-    0.7996809482574463, 0.44988900423049927, 0.7197399735450745, 0.6936293244361877, 
-    2.961095094680786, 2.7694199085235596, 3.0496184825897217, 2.1088054180145264, 
+LATENTS_STD = [
+    1.2223774194717407, 1.2767263650894165, 1.6831774711608887, 1.7549455165863037,
+    1.5636216402053833, 2.194143533706665, 0.9653137922286987, 1.0569885969161987,
+    0.841948926448822, 0.7729952931404114, 1.8955937623977661, 0.946841835975647,
+    0.7996809482574463, 0.44988900423049927, 0.7197399735450745, 0.6936293244361877,
+    2.961095094680786, 2.7694199085235596, 3.0496184825897217, 2.1088054180145264,
     3.276226282119751, 3.1627357006073, 2.2816812992095947, 2.6127843856811523
 ]
 
@@ -96,19 +106,17 @@ def _make_norm_tensors(device, dtype):
 # ROCm / Device Helper Functions
 # ==========================================
 def _is_rocm_build():
-    """ROCm PyTorch exposes AMD GPUs through the torch.cuda API."""
     return getattr(torch.version, "hip", None) is not None
 
 def _resolve_device(backend):
-    """Map the user-facing backend name to the device expected by PyTorch."""
     if backend == "cpu":
         return torch.device("cpu")
     if backend == "rocm":
         if not _is_rocm_build():
-            raise RuntimeError("ROCm was selected, but this PyTorch build has no HIP/ROCm support. Install a ROCm build of PyTorch.")
+            raise RuntimeError("ROCm was selected, but this PyTorch build has no HIP/ROCm support.")
         if not torch.cuda.is_available():
-            raise RuntimeError("ROCm was selected, but PyTorch cannot access an AMD GPU. Check drivers and permissions.")
-        return torch.device("cuda") # PyTorch uses 'cuda' device type for ROCm
+            raise RuntimeError("ROCm was selected, but PyTorch cannot access an AMD GPU.")
+        return torch.device("cuda")
     if backend == "cuda":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     raise ValueError(f"Unsupported device backend: {backend}")
@@ -121,7 +129,7 @@ def _backend_label(device):
     return "CPU"
 
 # ==========================================
-# 3D network components 
+# 3D network components
 # ==========================================
 def normalization(channels):
     return nn.GroupNorm(32, channels)
@@ -202,7 +210,7 @@ class TemporalConv(nn.Module):
         return identity + h
 
 # ==========================================
-# Pure-3D backbone with Temporal Chunking Switch
+# Pure-3D backbone with Temporal Chunking
 # ==========================================
 class LatentResizer3D(nn.Module):
     def __init__(self, in_channels=24, in_blocks=12, out_blocks=12,
@@ -213,7 +221,7 @@ class LatentResizer3D(nn.Module):
         embed_dim = 64
         self.embed = nn.Sequential(
             nn.Linear(1, embed_dim), nn.SiLU(), nn.Linear(embed_dim, embed_dim))
-        
+
         self.in_blocks = nn.ModuleList()
         for b in range(in_blocks):
             if (b == 1 or b == in_blocks - 1) and attn:
@@ -221,7 +229,7 @@ class LatentResizer3D(nn.Module):
             self.in_blocks.append(ResBlockEmb3D(channels, embed_dim, dropout))
             if temporal_every > 0 and b % temporal_every == 0:
                 self.in_blocks.append(TemporalConv(channels, temporal_kernel))
-                
+
         self.out_blocks = nn.ModuleList()
         for b in range(out_blocks):
             if (b == 1 or b == out_blocks - 1) and attn:
@@ -229,7 +237,7 @@ class LatentResizer3D(nn.Module):
             self.out_blocks.append(ResBlockEmb3D(channels, embed_dim, dropout))
             if temporal_every > 0 and b % temporal_every == 0:
                 self.out_blocks.append(TemporalConv(channels, temporal_kernel))
-                
+
         self.norm_out = normalization(channels)
         self.conv_out = nn.Conv3d(channels, in_channels, 3, padding=1)
 
@@ -245,74 +253,62 @@ class LatentResizer3D(nn.Module):
             return x
 
         B, C, T, H, W = x.shape
-        
+
         tk = 0
         for b in self.in_blocks:
             if isinstance(b, TemporalConv):
                 tk = b.dwconv.weight.shape[2]
                 break
-        
-        overlap = tk  # 重叠帧数
-        chunk = 24    # 每个分块的有效帧数
-        
+
+        overlap = tk
+        chunk = 32
+
         if not enable_chunking or T <= chunk:
             return self._forward_seg(x, scale, size)
 
         print(f"[MinimaxH3-3D] temporal chunking: T={T} chunks={(T + chunk - 1) // chunk} overlap={overlap}")
-        
+
         x_padded = F.pad(x, (0, 0, 0, 0, overlap, overlap), mode='replicate')
-        
+
         out_full = torch.zeros(B, C, T, size[-2], size[-1], device=x.device, dtype=x.dtype)
         weight_full = torch.zeros(1, 1, T, 1, 1, device=x.device, dtype=x.dtype)
-        
+
         start = 0
         while start < T:
             seg_start = start
             seg_end = min(T, start + chunk)
-            
-            # 【核心修复】输出范围包括重叠区域，确保分块之间有重叠
             out_start = max(0, seg_start - overlap)
             out_end = min(T, seg_end + overlap)
-            
-            # 在 padded 张量上的切片索引（需要额外的上下文）
             lo = max(0, out_start - overlap)
             hi = min(T + 2 * overlap, out_end + overlap)
-            
-            seg = x_padded[:, :, lo:hi]
+
+            seg = x_padded[:, :, lo:hi].contiguous()
             seg_size = (hi - lo, size[-2], size[-1])
             seg_out = self._forward_seg(seg, scale, seg_size)
-            
-            # 计算 seg_out 中对应 [out_start, out_end) 的索引
+
             s0 = (out_start + overlap) - lo
             s1 = s0 + (out_end - out_start)
-            
             valid_out = seg_out[:, :, s0:s1]
             n_valid = out_end - out_start
-            
-            # 【核心修复】创建正确的权重：有效区域权重为 1，重叠区域权重渐变
+
             weight = torch.ones(n_valid, device=x.device, dtype=x.dtype)
-            
-            # 在 [out_start, seg_start) 区域（前重叠区域），权重从 0 递增到 1
             if seg_start > out_start:
                 blend_len = seg_start - out_start
                 weight[:blend_len] = torch.arange(1, blend_len + 1, device=x.device, dtype=x.dtype) / (blend_len + 1)
-            
-            # 在 [seg_end, out_end) 区域（后重叠区域），权重从 1 递减到 0
             if out_end > seg_end:
                 blend_len = out_end - seg_end
                 weight[-blend_len:] = torch.arange(blend_len, 0, -1, device=x.device, dtype=x.dtype) / (blend_len + 1)
-            
-            # 累加加权后的分块输出
+
             out_full[:, :, out_start:out_end] += valid_out * weight.view(1, 1, n_valid, 1, 1)
             weight_full[:, :, out_start:out_end] += weight.view(1, 1, n_valid, 1, 1)
-            
+
             start += chunk
-        
-        # 归一化
+            del seg, seg_out, valid_out
+            if start % (chunk * 4) == 0:
+                gc.collect()
+
         out_full = out_full / weight_full.clamp(min=1e-8)
         return out_full
-            
-        return torch.cat(outs, dim=2)
 
     def _forward_seg(self, x, scale, size):
         scale_emb = torch.tensor(
@@ -351,19 +347,24 @@ def get_models_dir():
     return folder_paths.get_folder_paths(_LATENT_UPSCALE_FOLDER)[0]
 
 def scan_models():
-    files = []
-    model_dir = get_models_dir()
-    for ext in ("*.pth", "*.safetensors"):
-        files.extend(glob.glob(os.path.join(model_dir, ext)))
-    names = sorted(os.path.basename(f) for f in files)
-    return names if names else [f"(place models in: {model_dir})"]
+    names = [
+        name for name in folder_paths.get_filename_list(_LATENT_UPSCALE_FOLDER)
+        if os.path.splitext(name)[1].lower() in (".pth", ".safetensors")
+    ]
+    return names if names else [f"(place models in: {get_models_dir()})"]
 
 def _load_raw_sd(path):
     if path.endswith('.safetensors'):
-        from safetensors.torch import load_file
-        sd = load_file(path, device='cpu')
+        try:
+            from safetensors import safe_open
+            with safe_open(path, framework="pt", device="cpu") as f:
+                sd = {k: f.get_tensor(k) for k in f.keys()}
+        except ImportError:
+            from safetensors.torch import load_file
+            sd = load_file(path, device='cpu')
     else:
         sd = torch.load(path, map_location='cpu', weights_only=False)
+
     if isinstance(sd, dict) and 'model' in sd:
         sd = sd['model']
     sd = {k: v.to(torch.float16) if v.dtype == torch.float8_e4m3fn else v
@@ -409,7 +410,7 @@ def _detect_arch(sd):
     else:
         cfg["temporal_every"] = 0
 
-    if any('attn' in k for k in sd): cfg["attn"] = True 
+    if any('attn' in k for k in sd): cfg["attn"] = True
     cfg["attn"] = False
     return cfg
 
@@ -418,12 +419,12 @@ def load_model(name, device, precision):
     cache_key = f"{name}::{backend_lbl}::{precision}"
     if cache_key in MODEL_CACHE:
         model = MODEL_CACHE[cache_key]
-        print(f"[MinimaxH3-3D] 🔄 Loading model from cache to {device}")
-        return model.to(device)
+        return model.to(device, non_blocking=True)
 
-    path = os.path.join(get_models_dir(), name)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Model file not found: {path}")
+    try:
+        path = folder_paths.get_full_path_or_raise(_LATENT_UPSCALE_FOLDER, name)
+    except Exception as e:
+        raise FileNotFoundError(f"Model file not found: {name}") from e
 
     raw_sd = _load_raw_sd(path)
     up_sd = _extract_upscaler_sd(raw_sd)
@@ -464,7 +465,7 @@ class UpscaleConfig(TypedDict):
     megapixels: float
 
 class MinimaxH3LatentUpscaler3D(io.ComfyNode):
-    """Minimax H3 latent upscaler with pixel-space alignment and aspect-ratio lock."""
+    """Minimax H3 latent upscaler with Temporal Chunking and pixel-space alignment."""
 
     @classmethod
     def define_schema(cls):
@@ -485,24 +486,28 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
                             io.Float.Input("scale", default=2.0, min=1.0, max=4.0, step=0.05, tooltip="Upscale factor."),
                         ]),
                         io.DynamicCombo.Option(UpscaleMode.TARGET_DIMENSIONS, [
-                            io.Int.Input("width", default=1280, min=64, max=4096, step=8, tooltip="Target pixel width."),
-                            io.Int.Input("height", default=704, min=64, max=4096, step=8, tooltip="Target pixel height.")
+                            io.Int.Input("width", default=1280, min=64, max=8192, step=8, tooltip="Target pixel width."),
+                            io.Int.Input("height", default=704, min=64, max=8192, step=8, tooltip="Target pixel height.")
                         ]),
                         io.DynamicCombo.Option(UpscaleMode.MEGAPIXELS, [
-                            io.Float.Input("megapixels", default=1.0, min=0.1, max=8.0, step=0.1, tooltip="Target megapixels (1024x1024 = 1MP).")
+                            io.Float.Input("megapixels", default=1.0, min=0.1, max=16.0, step=0.1, tooltip="Target megapixels.")
                         ])
                     ],
                 ),
 
                 io.Int.Input("align", default=32, min=1, max=512, step=1,
-                             tooltip="Pixel-space alignment: output W/H are rounded to multiples of this value (e.g. 16/32/64). 32 is strictly recommended to avoid light banding."),
-                
-                io.Boolean.Input("enable_chunking", default=True,
-                                 tooltip="Enable temporal chunking to save VRAM for long videos. Turn off for short videos (<16 frames) for pure full-context inference."),
-                
-                io.Combo.Input("device", options=["cuda", "rocm", "cpu"], default="cuda", 
-                               tooltip="Execution backend. ROCm requires a HIP-enabled PyTorch build."),
-                io.Combo.Input("precision", options=["fp32", "fp16", "bf16"], default="fp16"), 
+                             tooltip="Pixel-space alignment. 32 is strictly recommended."),
+
+                # ---- 推理行为开关组 ----
+                io.Boolean.Input("enable_temporal_chunking", default=True,
+                                 tooltip="Enable temporal chunking to save VRAM for long videos and fix end-frame flickering."),
+                io.Boolean.Input("force_unload", default=True,
+                                 tooltip="Unload model to CPU after inference to free VRAM for subsequent nodes. "
+                                         "Disable if you run this node repeatedly to avoid reload overhead."),
+
+                # ---- 硬件 / 精度选项组 ----
+                io.Combo.Input("device", options=["cuda", "rocm", "cpu"], default="cuda"),
+                io.Combo.Input("precision", options=["fp32", "fp16", "bf16"], default="fp16"),
             ],
             outputs=[
                 io.AnyType.Output("latent", tooltip="Upscaled latent."),
@@ -511,7 +516,8 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
 
     @classmethod
     def execute(cls, latent: dict, model_name: str, mode: UpscaleConfig,
-                align: int, enable_chunking: bool, device: str, precision: str) -> io.NodeOutput:
+                align: int, enable_temporal_chunking: bool, force_unload: bool,
+                device: str, precision: str) -> io.NodeOutput:
 
         if model_name.startswith('('):
             raise ValueError("Please place model files into the latent_upscale_models directory")
@@ -524,14 +530,14 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
         dev = _resolve_device(device)
         compute_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[precision]
 
-        s = src.to(device=dev, dtype=compute_dtype).clone()
+        s = src.to(device=dev, dtype=compute_dtype, copy=True)
         if was_4d:
-            s = s.unsqueeze(2)  # (B, C, 1, H, W)
+            s = s.unsqueeze(2)
 
         b, c, t, h_in, w_in = s.shape
         downsample = VAE_DOWNSAMPLE
 
-        # 1. Theoretical target size in PIXEL space
+        # 1. Calculate Target Size
         if selected_mode == UpscaleMode.SCALE_BY:
             scale_val = mode["scale"]
             w_pixel_target = w_in * downsample * scale_val
@@ -551,16 +557,14 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
         else:
             raise ValueError(f"Unsupported mode: {selected_mode}")
 
-        # 2. Pixel-space alignment (强制长宽双向对齐，彻底解决底部光带)
+        # 2. Pixel-space alignment (双向对齐)
         alignment = max(1, align)
         w_pixel_aligned = round(w_pixel_target / alignment) * alignment
         h_pixel_aligned = round(h_pixel_target / alignment) * alignment
 
-        # 3. Snap to VAE grid so latent sizes are exact integers
         w_pixel_final = round(w_pixel_aligned / downsample) * downsample
         h_pixel_final = round(h_pixel_aligned / downsample) * downsample
 
-        # 4. Back to LATENT space
         w_out = max(1, int(w_pixel_final // downsample))
         h_out = max(1, int(h_pixel_final // downsample))
 
@@ -573,33 +577,40 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
         print(f"[MinimaxH3-3D] Latent {w_in}x{h_in} -> {w_out}x{h_out} | "
               f"Pixels {w_out * downsample}x{h_out * downsample} | scale={effective_scale:.3f}")
 
-        # 5. Inference
+        # 3. Inference
         model = load_model(model_name, dev, precision)
         norm_mean, norm_std = _make_norm_tensors(dev, compute_dtype)
 
         with torch.inference_mode():
-            # 放弃 in-place 操作，保障精度与画质
             s_norm = (s - norm_mean) / norm_std
-            # 传递 enable_chunking 参数
-            out = model(s_norm, scale=effective_scale, target_size=(t, h_out, w_out), enable_chunking=enable_chunking)
+            del s
+
+            out = model(s_norm, scale=effective_scale, target_size=(t, h_out, w_out),
+                        enable_chunking=enable_temporal_chunking)
+
             del s_norm
             out = out * norm_std + norm_mean
 
         if was_4d:
             out = out.squeeze(2)
 
-        out = out.to(device="cpu", dtype=orig_dtype)
+        out = out.to(device="cpu", dtype=orig_dtype, non_blocking=True)
 
-        # 推理结束后将模型踢回 CPU，释放显存给后续节点 (如 KSampler)
+        # 4. VRAM Management
         if dev.type == "cuda":
-            model.to("cpu")
-            torch.cuda.empty_cache()
-            print(f"[MinimaxH3-3D] ✅ Model offloaded to CPU. VRAM released for next node.")
+            if force_unload:
+                model.to("cpu", non_blocking=True)
+                print("[MinimaxH3-3D] ✅ Model offloaded to CPU. VRAM released.")
+            if HAS_COMFY_MM:
+                mm.soft_empty_cache()
+            else:
+                torch.cuda.empty_cache()
+            gc.collect()
 
         return io.NodeOutput({"samples": out})
 
 # ==========================================
-# New-API extension registration
+# Registration
 # ==========================================
 if USE_NEW_API:
     class MinimaxH3Extension(ComfyExtension):
@@ -610,9 +621,6 @@ if USE_NEW_API:
     async def comfy_entrypoint() -> MinimaxH3Extension:
         return MinimaxH3Extension()
 
-# ==========================================
-# Registration (both APIs)
-# ==========================================
 NODE_CLASS_MAPPINGS = {
     "MinimaxH3LatentUpscaler3D": MinimaxH3LatentUpscaler3D,
 }
