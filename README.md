@@ -14,6 +14,8 @@ Learned · High-fidelity · 2D & 3D Variants
 
 ## 📰 News
 
+- [2026-08-28] 🚀 **New node combo — MMH3 Split Upscale**: three new nodes (`MMH3 Temporal Split Params`, `MMH3 Spatial Split Params`, `MMH3 Split Upscale`) perform a tiled, hires-fix style latent re-sampling upscale for H3 video. Decomposed and optimized from the **Comfyui-MMH3-UltimateUpscale** project — splitting the AV latent into temporal chunks and spatial tiles, resampling each piece, and stitching with seam denoise, two-level color matching and temporal anchors to avoid seams and ghosting.
+- [2026-08-26] 🚀 **3D node memory & UX optimizations**: zero-copy model loading plus ComfyUI's native `soft_empty_cache` and explicit `.contiguous()` calls reduce RAM/VRAM spikes during load and inference; the post-inference CPU offload is now an optional `force_unload` toggle (default on); `enable_chunking` is renamed to `enable_temporal_chunking` and its effective chunk stride raised from 24 to 32; model files can now live in subfolders (PR #30); `target dimensions` and `megapixels` upper limits raised to 8192 px and 16 MP.
 - [2026-08-23] 🚀 **3D node improvements**: added an `enable_chunking` toggle (turn off for short clips to use full-context inference); fixed temporal-chunk edge artifacts with replicate padding and weighted overlap blending, eliminating end-frame flicker; added ROCm (AMD GPU) backend support via the new `rocm` device option.
 - [2026-08-21] 🚀 **3D node optimization**: The model is automatically offloaded to CPU after execution to free VRAM for subsequent second-pass sampling; width and height are independently aligned to the align grid (default 32), fixing the bottom light band issue; normalization/denormalization is changed from in-place operations to standard operations; temporal chunking is retained to support long videos.
 - [2026-08-19] 🚀 **3D node overhaul**: all three resize modes (`scale by multiplier`, `target dimensions`, `megapixels`) merged into a single node; fixed aspect-ratio mismatch in certain modes and edge artifacts at specific sizes; added a new example workflow and expanded the usage notes.
@@ -57,6 +59,32 @@ Two node variants are provided, both registered under the `video/MinimaxH3` cate
 > Both nodes support **upscaling only** (`effective scale >= 1.0`). `scale = 1.0` returns the input
 > unchanged; an effective scale below `1.0` raises an error.
 
+### MMH3 Split Upscale (combo)
+
+> **Origin:** this combo is a **decomposed and re-optimized version of the
+> Comfyui-MMH3-UltimateUpscale project**. The original monolithic node was broken into three composable nodes (temporal split /
+> spatial split / main upscaler), and the modules below were added on top of the original tiling
+> logic to improve stability and quality.
+
+A separate three-node combo that does a **tiled, hires-fix style re-sampling upscale** directly
+inside the diffusion sampler — instead of a pre-trained upscaler network. It takes the H3 **AV
+latent** (nested video 24ch + audio 32ch), splits it into **temporal chunks** and **spatial tiles**,
+runs the sampler on each piece, then stitches them back with seam-denoise, two-level color matching
+and temporal anchors so seams and ghosting don't appear. The two `* Split Params` nodes configure
+the splitting and feed the main `MMH3 Split Upscale` node (both optional — leave them unconnected
+for a single full-frame pass). It requires a `model` + `conditioning` + `sampler`/`sigmas`, i.e. it
+re-runs sampling at the higher resolution.
+
+**Modules added / optimized (relative to the original project):**
+
+| Module | What it adds / optimizes |
+| :--- | :--- |
+| **Prevention (预防)** | Freeze-prefill overlap band + **triple temporal anchors** (motion anchor + identity anchor + previous-chunk anchor) + cross-fade stitching — stops seams and forks from forming in the first place. |
+| **Correction (校正)** | **Two-level (spatial + temporal) color matching** + first-block source reference + per-chunk global pin-source (`grade_pin`) — keeps color & brightness consistent across tiles and chunks. |
+| **Anti-forking (抗分叉)** | `seam_denoise` cap — under high denoise + fast motion, the seam neighborhood is re-sampled at *medium* denoise so moving objects aren't sliced at the seam (suggested 0.5–0.8; 1.0 = off). |
+| **Fixes (修复)** | **Per-tile independent Guider** + cropped keyframes, and a **fixed probe-gated seam polish** (`seam_polish`) — each tile gets correctly-scoped conditioning/keyframes, and the polish gating no longer over/under-applies. |
+| **Simplification (简化)** | `overlap` / `fade` are now **percentage parameters** (resolution-independent) instead of absolute pixels. |
+
 ---
 
 ## 📸 Examples
@@ -81,9 +109,10 @@ Comfyui_Minimax_h3_latent_Upscaler/
 ├── workflow_templates/
 │   └── minimax_h3_r2v_Latent Upscaler example workflow.json  # example workflow for ComfyUI templates
 ├── nodes/
-│   ├── __init__.py                       # merges 2D/3D node mappings
+│   ├── __init__.py                       # merges 2D/3D/Split node mappings
 │   ├── minimax_h3_latent_upscaler_2d.py  # 2D backbone + Temporal 3D Conv (scale mode)
-│   └── minimax_h3_latent_upscaler_3d.py  # pure 3D convolution with 3 resize modes
+│   ├── minimax_h3_latent_upscaler_3d.py  # pure 3D convolution with 3 resize modes
+│   └── MMH3_Split_Upscale.py             # MMH3 Split Upscale combo (decomposed from Comfyui-MMH3-UltimateUpscale)
 ├── README.md
 ├── README_zh.md
 └── __init__.py
@@ -101,6 +130,9 @@ Comfyui_Minimax_h3_latent_Upscaler/
 - ✅ **Two backbones** — pick the fast **2D** variant or the temporally-coherent **3D** variant.
 - ✅ **Three ways to set output size on the 3D node** — `scale by multiplier`, `target dimensions`,
   or `megapixels`, all with pixel-grid alignment and aspect-ratio lock.
+- ✅ **Tiled hires-fix upscaler (MMH3 Split Upscale combo)** — re-sample the H3 AV latent at higher
+  resolution by splitting into temporal chunks + spatial tiles, with seam-denoise, two-level color
+  matching and temporal anchors to avoid seams and ghosting.
 - ✅ **24-channel Minimax H3 latent** — uses the exact per-channel mean/std normalization from
   training.
 - ✅ **Auto architecture detection** — reads `in_channels`, block counts, temporal config and
@@ -188,11 +220,12 @@ roughly the same as generating high-res directly. The benefit is purely faster t
 | `model_name` | dropdown | auto | scanned files | Checkpoint in `latent_upscale_models/` |
 | `mode` | dropdown | `scale by multiplier` | `scale by multiplier` / `target dimensions` / `megapixels` | How the output size is chosen |
 | `scale` | FLOAT | 2.0 | 1.0 – 4.0 (step 0.05) | Used when `mode` is `scale by multiplier` |
-| `width` | INT | 1280 | 64 – 4096 (step 8) | Target pixel width (used by `target dimensions`) |
-| `height` | INT | 704 | 64 – 4096 (step 8) | Target pixel height (used by `target dimensions`) |
-| `megapixels` | FLOAT | 1.0 | 0.1 – 8.0 (step 0.1) | Target total megapixels (used by `megapixels`); keeps aspect ratio |
+| `width` | INT | 1280 | 64 – 8192 (step 8) | Target pixel width (used by `target dimensions`) |
+| `height` | INT | 704 | 64 – 8192 (step 8) | Target pixel height (used by `target dimensions`) |
+| `megapixels` | FLOAT | 1.0 | 0.1 – 16.0 (step 0.1) | Target total megapixels (used by `megapixels`); keeps aspect ratio |
 | `align` | INT | 32 | 1 – 512 | Pixel-grid alignment: output W/H are independently rounded to multiples of this value (e.g. 16/32/64) |
-| `enable_chunking` | BOOLEAN | True | True / False | Split long videos into temporal chunks to cap VRAM; disable for short clips (<16 frames) for full-context inference |
+| `enable_temporal_chunking` | BOOLEAN | True | True / False | Split long videos into temporal chunks to cap VRAM; disable for short clips for full-context inference |
+| `force_unload` | BOOLEAN | True | True / False | Unload model to CPU after inference to free VRAM for subsequent nodes; disable if you reuse this node repeatedly to avoid reload overhead |
 | `device` | dropdown | cuda | cuda / rocm / cpu | Inference backend (ROCm needs a HIP-enabled PyTorch build) |
 | `precision` | dropdown | fp32 | fp32 / fp16 / bf16 | Inference precision |
 
@@ -201,6 +234,62 @@ roughly the same as generating high-res directly. The benefit is purely faster t
 > **Which node to pick?** Use **2D** for speed and when frames are already temporally stable; use
 > **3D** when you need stronger motion/temporal coherence or prefer specifying output size by
 > `target dimensions` / `megapixels`.
+
+### Node Reference — MMH3 Split Upscale (combo)
+
+A tiled, **hires-fix style** re-sampling upscaler for H3 video, **decomposed and optimized from the
+Comfyui-MMH3-UltimateUpscale project**. Unlike the 2D/3D nodes (which use a
+pre-trained upscaler network), this combo re-runs the diffusion sampler on a higher-resolution
+version of the latent, split into pieces so it fits in VRAM. It operates on the H3 **AV latent**
+(nested video 24ch + audio 32ch) and requires `model` + `conditioning` + `sampler`/`sigmas`.
+
+**`MMH3 Temporal Split Params`** — how to cut the clip along time (H3's native 5+17·m frame/token grid):
+
+| Parameter | Type | Default | Range / Options | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `chunk_frames` | INT | 73 | 5 – 100000 | Chunk length in frames (snapped to H3 token grid) |
+| `temporal_overlap_frames` | INT | 22 | 0 – 100000 | Overlap between consecutive chunks |
+| `anchor_strength` | FLOAT | 0.999 | 0.0 – 1.0 | Temporal anchor strength |
+| `motion_anchor_frames` | dropdown | 22 | 0 / 5 / 22 / 39 | Motion anchor length in frames |
+| `identity_anchor_frames` | INT | 24 | 0 – 240 | Spacing of identity anchors |
+
+Output: `temporal_split_param` (custom type, feeds the main node).
+
+**`MMH3 Spatial Split Params`** — how to cut each frame into tiles:
+
+| Parameter | Type | Default | Range / Options | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `tile_width` | INT | 512 | 64 – 16384 (step 32) | Tile width in pixels |
+| `tile_height` | INT | 512 | 64 – 16384 (step 32) | Tile height in pixels |
+| `overlap_ratio` | FLOAT | 0.25 | 0.0 – 0.90 | Overlap as a fraction of the tile |
+| `fade_ratio` | FLOAT | 0.50 | 0.0 – 1.0 | Fade band width within the overlap |
+| `min_tile_size` | INT | 256 | 0 – 16384 (step 32) | Minimum tile edge; avoids tiny edge tiles |
+| `seam_denoise` | FLOAT | 1.0 | 0.1 – 1.0 | Seam-neighborhood denoise cap; <1 prevents fast objects being cut at seams (suggest 0.5–0.8) |
+
+Outputs: `spatial_split_param` (custom type) + `grid_preview` (string, shows the computed tile/overlap grid).
+
+**`MMH3 Split Upscale`** — the main orchestrator:
+
+| Parameter | Type | Default | Range / Options | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `model` | MODEL | — | — | Diffusion model used for re-sampling |
+| `conditioning` | CONDITIONING | — | — | Positive conditioning |
+| `negative` | CONDITIONING | — | optional | Negative conditioning |
+| `latent` | LATENT | — | — | Input H3 AV latent (nested video 24ch + audio 32ch); batch 1 only |
+| `noise` | NOISE | — | — | Noise source for the sampler |
+| `sampler` | SAMPLER | — | — | Sampler |
+| `sigmas` | SIGMAS | — | — | Sigma schedule |
+| `cfg` | FLOAT | 1.0 | 0.0 – 100.0 | Classifier-free guidance scale |
+| `temporal_split_param` | custom | — | optional | From `MMH3 Temporal Split Params` |
+| `spatial_split_param` | custom | — | optional | From `MMH3 Spatial Split Params` |
+| `seam_polish` | dropdown | off | off / auto / all | Extra de-seam pass on detected seams |
+| `color_match` | BOOLEAN | True | True / False | Two-level color matching across tiles/chunks |
+
+**Output:** `LATENT` — the upscaled H3 AV latent, ready for VAE decode.
+
+> **Notes:** Both `* Split Params` nodes are optional — leave them unconnected for a single
+> full-frame pass (no temporal/spatial splitting). The combo re-runs the sampler at the higher
+> resolution, so it trades extra compute for VRAM headroom on long / high-res clips.
 
 ---
 
