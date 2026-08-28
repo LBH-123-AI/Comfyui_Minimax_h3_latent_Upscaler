@@ -14,7 +14,7 @@ Learned · High-fidelity · 2D & 3D Variants
 
 ## 📰 News
 
-- [2026-08-28] 🚀 **New node combo — MMH3 Split Upscale**: three new nodes (`MMH3 Temporal Split Params`, `MMH3 Spatial Split Params`, `MMH3 Split Upscale`) perform a tiled, hires-fix style latent re-sampling upscale for H3 video. Decomposed and optimized from the **Comfyui-MMH3-UltimateUpscale** project — splitting the AV latent into temporal chunks and spatial tiles, resampling each piece, and stitching with seam denoise, two-level color matching and temporal anchors to avoid seams and ghosting.
+- [2026-08-28] 🚀 **New node combo — MMH3 Split Upscale**: three new nodes (`MMH3 Temporal Split Params`, `MMH3 Spatial Split Params`, `MMH3 Split Upscale`) perform a tiled, hires-fix style latent re-sampling upscale for H3 video. Decomposed and optimized from the **Comfyui-MMH3-UltimateUpscale** project — splitting the AV latent into temporal chunks and spatial tiles, resampling each piece, and stitching with seam denoise, two-level color matching and temporal anchors. Key upgrades vs. original: more stable seams (`seam_denoise` + probe-gated seam polish), zero color drift (two-level matching + first-block/every-chunk pin-source), triple temporal anchors (frame-0/motion/identity), easier use (spatial params simplified to overlap/fade percentages snapping to the latent grid), and a lighter footprint (built-in upscale model removed in favor of an external pre-upscaled latent).
 - [2026-08-26] 🚀 **3D node memory & UX optimizations**: zero-copy model loading plus ComfyUI's native `soft_empty_cache` and explicit `.contiguous()` calls reduce RAM/VRAM spikes during load and inference; the post-inference CPU offload is now an optional `force_unload` toggle (default on); `enable_chunking` is renamed to `enable_temporal_chunking` and its effective chunk stride raised from 24 to 32; model files can now live in subfolders (PR #30); `target dimensions` and `megapixels` upper limits raised to 8192 px and 16 MP.
 - [2026-08-23] 🚀 **3D node improvements**: added an `enable_chunking` toggle (turn off for short clips to use full-context inference); fixed temporal-chunk edge artifacts with replicate padding and weighted overlap blending, eliminating end-frame flicker; added ROCm (AMD GPU) backend support via the new `rocm` device option.
 - [2026-08-21] 🚀 **3D node optimization**: The model is automatically offloaded to CPU after execution to free VRAM for subsequent second-pass sampling; width and height are independently aligned to the align grid (default 32), fixing the bottom light band issue; normalization/denormalization is changed from in-place operations to standard operations; temporal chunking is retained to support long videos.
@@ -63,27 +63,35 @@ Two node variants are provided, both registered under the `video/MinimaxH3` cate
 
 > **Origin:** this combo is a **decomposed and re-optimized version of the
 > Comfyui-MMH3-UltimateUpscale project**. The original monolithic node was broken into three composable nodes (temporal split /
-> spatial split / main upscaler), and the modules below were added on top of the original tiling
-> logic to improve stability and quality.
+> spatial split / main upscaler), and the enhancements below were layered on top of the original tiling
+> logic to improve seam stability, color consistency, temporal coherence, usability, and footprint.
 
 A separate three-node combo that does a **tiled, hires-fix style re-sampling upscale** directly
 inside the diffusion sampler — instead of a pre-trained upscaler network. It takes the H3 **AV
 latent** (nested video 24ch + audio 32ch), splits it into **temporal chunks** and **spatial tiles**,
-runs the sampler on each piece, then stitches them back with seam-denoise, two-level color matching
-and temporal anchors so seams and ghosting don't appear. The two `* Split Params` nodes configure
-the splitting and feed the main `MMH3 Split Upscale` node (both optional — leave them unconnected
-for a single full-frame pass). It requires a `model` + `conditioning` + `sampler`/`sigmas`, i.e. it
-re-runs sampling at the higher resolution.
+runs the sampler on each piece, then stitches them back seamlessly with seam-denoise, two-level color
+matching and temporal anchors so seams and ghosting don't appear. The two `* Split Params` nodes
+configure the splitting and feed the main `MMH3 Split Upscale` node (both optional — leave them
+unconnected for a single full-frame pass). It requires a `model` + `conditioning` + `sampler`/`sigmas`,
+i.e. it re-runs sampling at the higher resolution.
+
+**Key enhancements vs. the original project:**
+
+- **🧩 More stable seams (Seam / Ghosting):** a seam-neighborhood denoise cap (`seam_denoise`) plus a probe-gated second-pass seam polish (`seam_polish`) remove seams and ghosting; even under high denoise + fast motion, moving objects are no longer sliced ("broken limbs").
+- **🎨 Zero color drift (Color Zero-Drift):** spatial + temporal two-level color matching, with a global color reference pinned to the **first block** and to **every chunk** (`grade_pin`) — eliminates inter-tile flicker and the localized cyan/green tint (e.g. top-left corner).
+- **⏱️ Stronger temporal continuity:** a **triple temporal anchor** — `frame-0 anchor` + `motion anchor` + `identity anchor` — automatically backs up identity consistency under high denoise, so subjects don't drift.
+- **🖱️ Easier to use:** spatial parameters cut from 9 fields down to **percentages** (overlap ratio / fade ratio) that auto-snap to the latent grid; `negative` sits right next to `conditioning` for a more intuitive layout.
+- **🪶 Lighter footprint:** the built-in upscale model was removed in favor of an **external pre-upscaled latent** input — more controllable VRAM, and a node that stays focused on its job.
 
 **Modules added / optimized (relative to the original project):**
 
 | Module | What it adds / optimizes |
 | :--- | :--- |
-| **Prevention (预防)** | Freeze-prefill overlap band + **triple temporal anchors** (motion anchor + identity anchor + previous-chunk anchor) + cross-fade stitching — stops seams and forks from forming in the first place. |
-| **Correction (校正)** | **Two-level (spatial + temporal) color matching** + first-block source reference + per-chunk global pin-source (`grade_pin`) — keeps color & brightness consistent across tiles and chunks. |
-| **Anti-forking (抗分叉)** | `seam_denoise` cap — under high denoise + fast motion, the seam neighborhood is re-sampled at *medium* denoise so moving objects aren't sliced at the seam (suggested 0.5–0.8; 1.0 = off). |
+| **Prevention (预防)** | Freeze-prefill overlap band + **triple temporal anchors** (frame-0 anchor + motion anchor + identity anchor) + cross-fade stitching — stops seams and forks from forming in the first place. |
+| **Correction (校正)** | **Two-level (spatial + temporal) color matching** + first-block source reference + per-chunk global pin-source (`grade_pin`) — keeps color & brightness consistent across tiles and chunks, killing inter-tile flicker and localized cyan/green tint. |
+| **Anti-forking (抗分叉)** | `seam_denoise` cap — under high denoise + fast motion, the seam neighborhood is re-sampled at *medium* denoise so moving objects aren't sliced ("broken limbs"); combined with the probe-gated second-pass seam polish, seams and ghosting are both eliminated (suggested 0.5–0.8; 1.0 = off). |
 | **Fixes (修复)** | **Per-tile independent Guider** + cropped keyframes, and a **fixed probe-gated seam polish** (`seam_polish`) — each tile gets correctly-scoped conditioning/keyframes, and the polish gating no longer over/under-applies. |
-| **Simplification (简化)** | `overlap` / `fade` are now **percentage parameters** (resolution-independent) instead of absolute pixels. |
+| **Simplification (简化)** | `overlap` / `fade` are now **percentage parameters** (overlap ratio / fade ratio, resolution-independent) instead of absolute pixels, and auto-snap to the latent grid; `negative` sits next to `conditioning` for a more intuitive layout. |
 
 ---
 
