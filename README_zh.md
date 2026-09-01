@@ -211,6 +211,7 @@ ComfyUI/models/latent_upscale_models/
 | `align` | INT | 32 | 1 – 512 | 像素网格对齐：输出 W/H 会分别独立取整到该值的倍数（如 16/32/64） |
 | `enable_temporal_chunking` | BOOLEAN | True | True / False | 长视频时间分块以压低显存峰值；短片段可关闭，使用全上下文推理 |
 | `force_unload` | BOOLEAN | True | True / False | 推理后将模型卸载到 CPU，为后续节点释放显存；若重复使用本节点可关闭，避免重复加载开销 |
+| `temporal_chunk_frames` | 下拉框 | 32 | 4 / 8 / 12 / 24 / 32 | 每个时间分块处理的 latent 帧数；数值越小，Conv3D 峰值显存越低，但处理次数越多 |
 | `device` | 下拉框 | cuda | cuda / rocm / cpu | 推理后端（ROCm 需要支持 HIP 的 PyTorch 构建） |
 | `precision` | 下拉框 | fp32 | fp32 / fp16 / bf16 | 推理精度 |
 
