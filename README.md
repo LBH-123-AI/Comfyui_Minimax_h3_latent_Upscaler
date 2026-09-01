@@ -234,6 +234,7 @@ roughly the same as generating high-res directly. The benefit is purely faster t
 | `align` | INT | 32 | 1 – 512 | Pixel-grid alignment: output W/H are independently rounded to multiples of this value (e.g. 16/32/64) |
 | `enable_temporal_chunking` | BOOLEAN | True | True / False | Split long videos into temporal chunks to cap VRAM; disable for short clips for full-context inference |
 | `force_unload` | BOOLEAN | True | True / False | Unload model to CPU after inference to free VRAM for subsequent nodes; disable if you reuse this node repeatedly to avoid reload overhead |
+| `temporal_chunk_frames` | dropdown | 32 | 4 / 8 / 12 / 24 / 32 | Latent frames per temporal chunk; lower values reduce Conv3D peak VRAM at the cost of additional passes |
 | `device` | dropdown | cuda | cuda / rocm / cpu | Inference backend (ROCm needs a HIP-enabled PyTorch build) |
 | `precision` | dropdown | fp32 | fp32 / fp16 / bf16 | Inference precision |
 
