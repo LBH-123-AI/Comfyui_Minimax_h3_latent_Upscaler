@@ -23,4 +23,15 @@ try:
 except Exception as e:
     logging.error(f"[MinimaxH3] Failed to import 3D node: {e}")
 
+# MMH3 Split Upscale combo: legacy API (Temporal/Spatial params + main upscale node)
+try:
+    from .MMH3_Split_Upscale import (
+        NODE_CLASS_MAPPINGS as NODE_CLASS_MAPPINGS_SPLIT,
+        NODE_DISPLAY_NAME_MAPPINGS as NODE_DISPLAY_NAME_MAPPINGS_SPLIT,
+    )
+    NODE_CLASS_MAPPINGS.update(NODE_CLASS_MAPPINGS_SPLIT)
+    NODE_DISPLAY_NAME_MAPPINGS.update(NODE_DISPLAY_NAME_MAPPINGS_SPLIT)
+except Exception as e:
+    logging.error(f"[MinimaxH3] Failed to import MMH3 Split Upscale node: {e}")
+
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
