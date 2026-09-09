@@ -167,7 +167,34 @@ ComfyUI/models/latent_upscale_models/
 预训练权重可在此下载：
 [huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
 
-加载器会自动识别结构，只要权重存储的结构匹配，2D 与 3D 节点可共用同一份权重。
+请使用与权重主干匹配的节点：2D 权重使用 2D 节点，3D 权重使用 3D 节点。
+通道数和残差块数量会自动识别。
+
+**Asirus BF16 MAXQUALITY：**
+[`minimax_h3_bf16_CONSERVATIVE_v5.safetensors`](https://huggingface.co/Asirus/Minimax-H3-Latent-Upscaler-BF16-MAXQUALITY)
+请使用 **Minimax H3 Latent Upscaler (3D)**，设置 `precision = bf16`。
+该模型混合保存 BF16 和 FP16 张量。在 `bf16` 模式下，包含 FP16/FP32 参数的层使用
+FP32 运算，以保留回退参数的精度，并避免 FP16 激活溢出；其余层使用 BF16。
+同一层的权重和偏置可以采用不同的存储精度。检测依据是张量类型，不依赖文件名或目录名。
+
+该模型的回退层占参数总量的 0.67%，额外权重内存约为 4.44 MiB。
+激活类型转换和 FP32 运算仍会增加运行时间及激活内存开销。
+选择 `fp16` 或 `fp32` 时仍强制使用统一精度；普通单一精度权重的行为不变。
+
+本地 RTX 5090 测试（PyTorch 2.11.0、实际权重、合成归一化 latent、空间放大 2 倍，
+预热 2 次后取 7 次推理的中位数）：
+
+| 输出尺寸 / latent 时间步数 | 统一 BF16 | BF16 + FP32 回退 | 耗时增加 |
+| :--- | ---: | ---: | ---: |
+| 384×256 / 2 | 16.1 ms | 18.9 ms | 17.4% |
+| 1280×768 / 8 | 83.0 ms | 88.1 ms | 6.1% |
+| 640×384 / 33，时间分块 | 142.3 ms | 159.9 ms | 12.4% |
+
+后两项测试的峰值 GPU 分配内存分别增加 124.4 MiB 和 149.5 MiB。
+以上仅计模型前向推理，不含加载、卸载及 VAE 解码，不代表最终视频画质评估。
+测试时 GPU 上还有其他进程。[原始结果](tests/benchmark_results/rtx5090_asirus.json)
+包含各次耗时与实验性 FP16 回退对比。可用以下命令复现：
+`python tests/benchmark_mixed_precision.py /path/to/model.safetensors --output /tmp/h3-benchmark.json`。
 
 ---
 

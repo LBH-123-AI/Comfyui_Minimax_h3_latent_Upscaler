@@ -180,7 +180,9 @@ class ResBlockEmb3D(nn.Module):
 
     def forward(self, x, emb):
         h = self.in_layers(x)
-        emb_out = self.emb_layers(emb).type(h.dtype)
+        # Mixed checkpoints keep the embedding and affine normalization in FP32.
+        # Match the normalization dtype so the modulation is not rounded to BF16.
+        emb_out = self.emb_layers(emb).to(self.out_norm.weight.dtype)
         while len(emb_out.shape) < len(h.shape):
             emb_out = emb_out[..., None]
         scale, shift = torch.chunk(emb_out, 2, dim=1)
@@ -270,8 +272,10 @@ class LatentResizer3D(nn.Module):
 
         x_padded = F.pad(x, (0, 0, 0, 0, overlap, overlap), mode='replicate')
 
-        out_full = torch.zeros(B, C, T, size[-2], size[-1], device=x.device, dtype=x.dtype)
-        weight_full = torch.zeros(1, 1, T, 1, 1, device=x.device, dtype=x.dtype)
+        # Preserve the output head's precision when blending mixed-precision chunks.
+        output_dtype = self.conv_out.weight.dtype
+        out_full = torch.zeros(B, C, T, size[-2], size[-1], device=x.device, dtype=output_dtype)
+        weight_full = torch.zeros(1, 1, T, 1, 1, device=x.device, dtype=output_dtype)
 
         start = 0
         while start < T:
@@ -291,13 +295,13 @@ class LatentResizer3D(nn.Module):
             valid_out = seg_out[:, :, s0:s1]
             n_valid = out_end - out_start
 
-            weight = torch.ones(n_valid, device=x.device, dtype=x.dtype)
+            weight = torch.ones(n_valid, device=x.device, dtype=output_dtype)
             if seg_start > out_start:
                 blend_len = seg_start - out_start
-                weight[:blend_len] = torch.arange(1, blend_len + 1, device=x.device, dtype=x.dtype) / (blend_len + 1)
+                weight[:blend_len] = torch.arange(1, blend_len + 1, device=x.device, dtype=output_dtype) / (blend_len + 1)
             if out_end > seg_end:
                 blend_len = out_end - seg_end
-                weight[-blend_len:] = torch.arange(blend_len, 0, -1, device=x.device, dtype=x.dtype) / (blend_len + 1)
+                weight[-blend_len:] = torch.arange(blend_len, 0, -1, device=x.device, dtype=output_dtype) / (blend_len + 1)
 
             out_full[:, :, out_start:out_end] += valid_out * weight.view(1, 1, n_valid, 1, 1)
             weight_full[:, :, out_start:out_end] += weight.view(1, 1, n_valid, 1, 1)
@@ -414,6 +418,38 @@ def _detect_arch(sd):
     cfg["attn"] = False
     return cfg
 
+def _cast_layer_input(module, args):
+    """Bridge activation dtypes at mixed-precision Conv/Linear/GroupNorm boundaries."""
+    return (args[0].to(dtype=module.weight.dtype), *args[1:])
+
+def _configure_precision(model, sd, precision):
+    dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[precision]
+    source_dtypes = {tensor.dtype for tensor in sd.values()}
+    mixed_bf16 = (
+        dtype == torch.bfloat16
+        and torch.bfloat16 in source_dtypes
+        and bool(source_dtypes & {torch.float16, torch.float32})
+    )
+    if not mixed_bf16:
+        model.to(dtype=dtype)
+        return 0
+
+    fallback_layers = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, (nn.Conv3d, nn.Linear, nn.GroupNorm)):
+            continue
+        # Both weights and biases matter: the Asirus checkpoint mixes their dtypes
+        # even within a single layer. FP32 represents both BF16 and FP16 exactly,
+        # and avoids overflowing BF16 activations when entering fallback layers.
+        needs_fallback = any(
+            sd[f"{name}.{key}"].dtype in (torch.float16, torch.float32)
+            for key, _ in module.named_parameters(recurse=False)
+        )
+        module.to(dtype=torch.float32 if needs_fallback else torch.bfloat16)
+        module.register_forward_pre_hook(_cast_layer_input)
+        fallback_layers += int(needs_fallback)
+    return fallback_layers
+
 def load_model(name, device, precision):
     backend_lbl = _backend_label(device)
     cache_key = f"{name}::{backend_lbl}::{precision}"
@@ -436,10 +472,8 @@ def load_model(name, device, precision):
         temporal_every=cfg["temporal_every"], temporal_kernel=cfg["temporal_kernel"],
     )
     model.load_state_dict(up_sd, strict=True)
-    dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(precision, torch.float32)
+    fallback_layers = _configure_precision(model, up_sd, precision)
     model = model.to(device).eval().requires_grad_(False)
-    if dtype != torch.float32:
-        model = model.to(dtype)
 
     MODEL_CACHE[cache_key] = model
     print(f"[MinimaxH3-3D] Loaded upscale model: {name}")
@@ -447,6 +481,9 @@ def load_model(name, device, precision):
           f"Attn: forced off | Temporal: {'on' if cfg['temporal_every'] > 0 else 'off'} "
           f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']}) | "
           f"Backend: {backend_lbl} | Precision: {precision}")
+    if fallback_layers:
+        print(f"  Mixed checkpoint: {fallback_layers} fallback layers run in FP32 "
+              "to preserve their FP16/FP32 weights; remaining layers use BF16.")
     return model
 
 # ==========================================
@@ -507,7 +544,8 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
 
                 # ---- 硬件 / 精度选项组 ----
                 io.Combo.Input("device", options=["cuda", "rocm", "cpu"], default="cuda"),
-                io.Combo.Input("precision", options=["fp32", "fp16", "bf16"], default="fp16"),
+                io.Combo.Input("precision", options=["fp32", "fp16", "bf16"], default="fp16",
+                               tooltip="For mixed BF16/FP16 checkpoints, bf16 preserves fallback layers in FP32."),
             ],
             outputs=[
                 io.AnyType.Output("latent", tooltip="Upscaled latent."),
