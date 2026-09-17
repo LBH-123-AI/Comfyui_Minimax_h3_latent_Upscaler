@@ -185,8 +185,37 @@ automatically in the node's `model_name` dropdown.
 Pre-trained checkpoints are available at:
 [huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
 
-The loader auto-detects the architecture, so a single checkpoint works for both the 2D and 3D
-nodes as long as the stored structure matches.
+Use the node matching the checkpoint's backbone: 2D weights for the 2D node and 3D weights
+for the 3D node. Channel counts and block counts are detected automatically.
+
+**Asirus BF16 MAXQUALITY:**
+[`minimax_h3_bf16_CONSERVATIVE_v5.safetensors`](https://huggingface.co/Asirus/Minimax-H3-Latent-Upscaler-BF16-MAXQUALITY)
+is supported by **Minimax H3 Latent Upscaler (3D)** with `precision = bf16`.
+This checkpoint mixes BF16 and FP16 tensors. In `bf16` mode, the loader preserves fallback
+values by running layers containing FP16/FP32 parameters in FP32; the other layers run in
+BF16. This handles mixed weight/bias dtypes and avoids FP16 activation overflow. Detection
+uses tensor dtypes, so renaming the file or storing it in a subfolder works too.
+
+For this checkpoint, fallback layers contain 0.67% of the parameters and add about 4.44 MiB
+of weight memory. Activation casts and FP32 operations add runtime and activation-memory
+overhead. Selecting `fp16` or `fp32` still
+forces uniform precision, and ordinary single-dtype checkpoints keep their existing behavior.
+
+Local RTX 5090 testing (PyTorch 2.11.0, actual checkpoint, synthetic normalized latents,
+2× spatial upscale, median of seven runs after two warmups) measured:
+
+| Output size / latent time steps | Uniform BF16 | BF16 + FP32 fallback | Runtime increase |
+| :--- | ---: | ---: | ---: |
+| 384×256 / 2 | 16.1 ms | 18.9 ms | 17.4% |
+| 1280×768 / 8 | 83.0 ms | 88.1 ms | 6.1% |
+| 640×384 / 33, temporal chunking | 142.3 ms | 159.9 ms | 12.4% |
+
+Peak allocated GPU memory increased by 124.4 MiB and 149.5 MiB in the two larger cases.
+These are model-forward timings, excluding loading, offload, and VAE decoding; they do not
+measure rendered-video quality. The GPU was shared with an existing process.
+[Raw results](tests/benchmark_results/rtx5090_asirus.json) include samples and an experimental
+FP16 fallback comparison. Reproduce with
+`python tests/benchmark_mixed_precision.py /path/to/model.safetensors --output /tmp/h3-benchmark.json`.
 
 ---
 

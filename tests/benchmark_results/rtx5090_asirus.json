@@ -1,0 +1,228 @@
+{
+  "checkpoint": "/tmp/minimax_h3_bf16_CONSERVATIVE_v5.safetensors",
+  "torch": "2.11.0+cu130",
+  "cuda": "13.0",
+  "cudnn": 91900,
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "gpu_before": "NVIDIA GeForce RTX 5090, 20868 MiB, 6 %, 40",
+  "cudnn_benchmark": false,
+  "cudnn_allow_tf32": true,
+  "warmup": 2,
+  "repeats": 7,
+  "input": "seeded synthetic normalized latents; no VAE or video-quality comparison",
+  "cases": [
+    {
+      "name": "short_384x256",
+      "input_shape": [
+        1,
+        24,
+        2,
+        8,
+        12
+      ],
+      "target_size": [
+        2,
+        16,
+        24
+      ],
+      "chunking": false,
+      "variants": {
+        "uniform_bf16": {
+          "median_ms": 16.079347988124937,
+          "samples_ms": [
+            18.074998981319368,
+            18.91894597792998,
+            15.498180990107358,
+            15.239120984915644,
+            16.578348993789405,
+            16.079347988124937,
+            15.112596040125936
+          ],
+          "peak_allocated_mib": 714.7080078125,
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "gpu_after": "NVIDIA GeForce RTX 5090, 22229 MiB, 4 %, 42",
+          "rmse_vs_fp32": 0.0071401214227080345,
+          "max_abs_error_vs_fp32": 0.06838417053222656
+        },
+        "mixed_fp32_fallback": {
+          "median_ms": 18.86980899143964,
+          "samples_ms": [
+            21.969405992422253,
+            18.988654017448425,
+            18.61638796981424,
+            18.079920031595975,
+            18.59180798055604,
+            18.86980899143964,
+            20.20938601344824
+          ],
+          "peak_allocated_mib": 722.1484375,
+          "finite": true,
+          "output_dtype": "torch.float32",
+          "gpu_after": "NVIDIA GeForce RTX 5090, 22229 MiB, 30 %, 42",
+          "rmse_vs_fp32": 0.0033133276738226414,
+          "max_abs_error_vs_fp32": 0.02333354949951172
+        },
+        "mixed_fp16_fallback": {
+          "median_ms": 25.985968008171767,
+          "samples_ms": [
+            27.913803001865745,
+            25.095742952544242,
+            25.350892974529415,
+            25.019016989972442,
+            26.796776975970715,
+            31.14333498524502,
+            25.985968008171767
+          ],
+          "peak_allocated_mib": 716.2080078125,
+          "finite": true,
+          "output_dtype": "torch.float16",
+          "gpu_after": "NVIDIA GeForce RTX 5090, 22234 MiB, 33 %, 44",
+          "rmse_vs_fp32": 0.0029176967218518257,
+          "max_abs_error_vs_fp32": 0.018300294876098633
+        }
+      }
+    },
+    {
+      "name": "video_1280x768",
+      "input_shape": [
+        1,
+        24,
+        8,
+        24,
+        40
+      ],
+      "target_size": [
+        8,
+        48,
+        80
+      ],
+      "chunking": false,
+      "variants": {
+        "uniform_bf16": {
+          "median_ms": 82.99511700170115,
+          "samples_ms": [
+            80.54874202935025,
+            82.81515404814854,
+            82.99511700170115,
+            83.75772804720327,
+            82.82507298281416,
+            83.40311096981168,
+            84.01593600865453
+          ],
+          "peak_allocated_mib": 946.05078125,
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "gpu_after": "NVIDIA GeForce RTX 5090, 22591 MiB, 99 %, 61"
+        },
+        "mixed_fp32_fallback": {
+          "median_ms": 88.09033699799329,
+          "samples_ms": [
+            89.56277801189572,
+            90.31509002670646,
+            88.09033699799329,
+            88.01536000100896,
+            87.91258395649493,
+            87.88507501594722,
+            88.76595000037923
+          ],
+          "peak_allocated_mib": 1070.4912109375,
+          "finite": true,
+          "output_dtype": "torch.float32",
+          "gpu_after": "NVIDIA GeForce RTX 5090, 22640 MiB, 99 %, 61"
+        },
+        "mixed_fp16_fallback": {
+          "median_ms": 83.60940200509503,
+          "samples_ms": [
+            83.49054801510647,
+            82.94342999579385,
+            83.60940200509503,
+            81.67409803718328,
+            84.45530897006392,
+            83.75456696376204,
+            87.13227498810738
+          ],
+          "peak_allocated_mib": 1006.05078125,
+          "finite": true,
+          "output_dtype": "torch.float16",
+          "gpu_after": "NVIDIA GeForce RTX 5090, 22669 MiB, 99 %, 54"
+        }
+      }
+    },
+    {
+      "name": "chunked_640x384",
+      "input_shape": [
+        1,
+        24,
+        33,
+        12,
+        20
+      ],
+      "target_size": [
+        33,
+        24,
+        40
+      ],
+      "chunking": true,
+      "variants": {
+        "uniform_bf16": {
+          "median_ms": 142.3426729743369,
+          "samples_ms": [
+            142.72402797359973,
+            144.27084795897827,
+            142.54514599451795,
+            141.76063699414954,
+            142.3426729743369,
+            142.28419598657638,
+            140.5292859999463
+          ],
+          "peak_allocated_mib": 1066.02783203125,
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "gpu_after": "NVIDIA GeForce RTX 5090, 22838 MiB, 100 %, 57"
+        },
+        "mixed_fp32_fallback": {
+          "median_ms": 159.9475410184823,
+          "samples_ms": [
+            158.53388799587265,
+            160.99758900236338,
+            165.89348699199036,
+            165.61427898705006,
+            158.65659300470725,
+            159.9475410184823,
+            157.82468498218805
+          ],
+          "peak_allocated_mib": 1215.54345703125,
+          "finite": true,
+          "output_dtype": "torch.float32",
+          "gpu_after": "NVIDIA GeForce RTX 5090, 22986 MiB, 98 %, 57"
+        },
+        "mixed_fp16_fallback": {
+          "median_ms": 151.10724000260234,
+          "samples_ms": [
+            146.10042498679832,
+            146.53428900055587,
+            152.42078801384196,
+            155.4679480032064,
+            152.3449009982869,
+            150.07180999964476,
+            151.10724000260234
+          ],
+          "peak_allocated_mib": 1138.02783203125,
+          "finite": true,
+          "output_dtype": "torch.float16",
+          "gpu_after": "NVIDIA GeForce RTX 5090, 22955 MiB, 98 %, 56"
+        }
+      }
+    }
+  ],
+  "checkpoint_sha256": "3238947b064f6b7ae65d997cfec2645cbea05fe2086c725f3f595f0064de02d5",
+  "gpu_after": "NVIDIA GeForce RTX 5090, 21529 MiB, 98 %, 56",
+  "validation_notes": [
+    "Actual Asirus checkpoint with seeded synthetic normalized latents.",
+    "Model forward timings include CUDA synchronization and exclude loading, CPU offload, and VAE decoding.",
+    "Each variant runs separately after two warmups; seven timed forwards per case.",
+    "GPU was shared with an existing process; samples and GPU snapshots are retained.",
+    "The FP32 numerical reference uses the recorded cuDNN TF32 setting; numerical error is not a visual-quality score."
+  ]
+}
