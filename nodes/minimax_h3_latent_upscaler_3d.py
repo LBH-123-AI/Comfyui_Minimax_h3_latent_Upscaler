@@ -241,7 +241,8 @@ class LatentResizer3D(nn.Module):
         self.norm_out = normalization(channels)
         self.conv_out = nn.Conv3d(channels, in_channels, 3, padding=1)
 
-    def forward(self, x, scale=None, target_size=None, enable_chunking=True):
+    def forward(self, x, scale=None, target_size=None, enable_chunking=True,
+                temporal_chunk_frames=32):
         if target_size is not None:
             size = target_size
         elif scale is not None:
@@ -261,7 +262,7 @@ class LatentResizer3D(nn.Module):
                 break
 
         overlap = tk
-        chunk = 32
+        chunk = max(1, int(temporal_chunk_frames))
 
         if not enable_chunking or T <= chunk:
             return self._forward_seg(x, scale, size)
@@ -505,6 +506,13 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
                                  tooltip="Unload model to CPU after inference to free VRAM for subsequent nodes. "
                                          "Disable if you run this node repeatedly to avoid reload overhead."),
 
+                io.Combo.Input(
+                    "temporal_chunk_frames",
+                    options=["4", "8", "12", "24", "32"],
+                    default="32",
+                    tooltip="Latent frames processed per temporal chunk. Smaller values reduce Conv3D peak VRAM but require more passes.",
+                ),
+
                 # ---- 硬件 / 精度选项组 ----
                 io.Combo.Input("device", options=["cuda", "rocm", "cpu"], default="cuda"),
                 io.Combo.Input("precision", options=["fp32", "fp16", "bf16"], default="fp16"),
@@ -517,7 +525,7 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
     @classmethod
     def execute(cls, latent: dict, model_name: str, mode: UpscaleConfig,
                 align: int, enable_temporal_chunking: bool, force_unload: bool,
-                device: str, precision: str) -> io.NodeOutput:
+                temporal_chunk_frames: str, device: str, precision: str) -> io.NodeOutput:
 
         if model_name.startswith('('):
             raise ValueError("Please place model files into the latent_upscale_models directory")
@@ -586,7 +594,8 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
             del s
 
             out = model(s_norm, scale=effective_scale, target_size=(t, h_out, w_out),
-                        enable_chunking=enable_temporal_chunking)
+                        enable_chunking=enable_temporal_chunking,
+                        temporal_chunk_frames=int(temporal_chunk_frames))
 
             del s_norm
             out = out * norm_std + norm_mean
