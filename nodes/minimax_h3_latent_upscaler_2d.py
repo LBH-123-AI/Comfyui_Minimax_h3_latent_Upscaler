@@ -14,6 +14,14 @@ import folder_paths
 import re
 from einops import rearrange
 
+import comfy.model_management as mm
+import comfy.utils
+
+from .comfy_dynamic import (
+    build_comfy_model,
+    estimate_upscale_activation_memory,
+)
+
 # ==========================================
 # 注册模型文件夹
 # ==========================================
@@ -277,14 +285,14 @@ def scan_models():
     return names if names else [f"(请将模型放入: {model_dir})"]
 
 def _load_raw_sd(path):
-    if path.endswith('.safetensors'):
-        from safetensors.torch import load_file
-        sd = load_file(path, device='cpu')
-    else:
-        sd = torch.load(path, map_location='cpu', weights_only=False)
+    sd = comfy.utils.load_torch_file(
+        path,
+        safe_load=True,
+        device=torch.device("cpu"),
+    )
     if isinstance(sd, dict) and 'model' in sd:
         sd = sd['model']
-    # 转换 FP8 为 FP16 方便处理
+    # Keep the existing FP8 compatibility behavior; manual_cast will cast per layer.
     sd = {k: v.to(torch.float16) if v.dtype == torch.float8_e4m3fn else v
           for k, v in sd.items()}
     return sd
@@ -366,40 +374,46 @@ def load_model(name, device, precision):
 
     raw_sd = _load_raw_sd(path)
     up_sd = _extract_upscaler_sd(raw_sd)
-
     cfg = _detect_arch(up_sd)
-
-    # 构建模型 (与训练完全一致)
-    model = VideoLatentResizer(
-        in_channels=cfg["in_channels"],
-        in_blocks=cfg["in_blocks"],
-        out_blocks=cfg["out_blocks"],
-        channels=cfg["channels"],
-        dropout=cfg["dropout"],
-        attn=cfg["attn"],                # 强制 False
-        temporal_every=cfg["temporal_every"],
-        temporal_kernel=cfg["temporal_kernel"],
+    dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(
+        precision, torch.float32
     )
 
-    # 加载权重，忽略不匹配的键 (如 attn 层若训练有但推理强制关闭)
-    missing, unexpected = model.load_state_dict(up_sd, strict=False)
+    def factory():
+        return VideoLatentResizer(
+            in_channels=cfg["in_channels"],
+            in_blocks=cfg["in_blocks"],
+            out_blocks=cfg["out_blocks"],
+            channels=cfg["channels"],
+            dropout=cfg["dropout"],
+            attn=cfg["attn"],                # 强制 False
+            temporal_every=cfg["temporal_every"],
+            temporal_kernel=cfg["temporal_kernel"],
+        )
+
+    patcher, incompatible = build_comfy_model(
+        factory,
+        up_sd,
+        requested_device=device,
+        dtype=dtype,
+        strict=False,
+    )
+
+    missing, unexpected = incompatible.missing_keys, incompatible.unexpected_keys
     if missing:
         print(f"[MinimaxH3] 缺少键: {missing[:5]}... (可能由于 attn 强制关闭)")
     if unexpected:
         print(f"[MinimaxH3] 多余键: {unexpected[:5]}... (可能来自合并文件的其他部分)")
 
-    dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(precision, torch.float32)
-    model = model.to(device).eval()
-    if dtype != torch.float32:
-        model = model.to(dtype)
-
-    MODEL_CACHE[cache_key] = model
+    MODEL_CACHE[cache_key] = patcher
+    model = patcher.model
 
     print(f"[MinimaxH3] 加载放大模型: {name}")
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,} | "
           f"Attn: 强制关闭 | Temporal: {'✓' if cfg['temporal_every']>0 else '✗'} "
-          f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']})")
-    return model
+          f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']}) | "
+          f"DynamicVRAM: {'on' if patcher.is_dynamic() else 'fallback'}")
+    return patcher
 
 # ==========================================
 # ComfyUI 节点 (2D 版本)
@@ -432,8 +446,10 @@ class MinimaxH3LatentUpscalerNode2D:
         if scale < 1.0:
             raise ValueError("仅支持放大 (scale >= 1.0)")
 
-        dev = torch.device(device if torch.cuda.is_available() else "cpu")
-        model = load_model(model_name, dev, precision)
+        requested_dev = torch.device(device if torch.cuda.is_available() else "cpu")
+        model_patcher = load_model(model_name, requested_dev, precision)
+        dev = model_patcher.load_device
+        model = model_patcher.model
 
         s = latent["samples"].clone()
         orig_dtype = s.dtype
@@ -448,10 +464,19 @@ class MinimaxH3LatentUpscalerNode2D:
         norm_mean, norm_std = _make_norm_tensors(dev, compute_dtype)
         s = (s - norm_mean) / norm_std
 
-        with torch.no_grad():
-            # 目标空间尺寸 (H, W)，时间维度不变
-            T, H, W = s.shape[2], s.shape[3], s.shape[4]
-            target_hw = (int(round(H * scale)), int(round(W * scale)))
+        # 目标空间尺寸 (H, W)，时间维度不变
+        T, H, W = s.shape[2], s.shape[3], s.shape[4]
+        target_hw = (int(round(H * scale)), int(round(W * scale)))
+
+        memory_required = estimate_upscale_activation_memory(
+            s.shape,
+            target_hw,
+            model.resizer.conv_in.out_channels,
+            compute_dtype,
+        )
+        mm.load_models_gpu([model_patcher], memory_required=memory_required)
+
+        with torch.inference_mode():
             out = model(s, scale=scale, target_hw=target_hw)
 
         # 反归一化
@@ -464,7 +489,7 @@ class MinimaxH3LatentUpscalerNode2D:
         out = out.cpu().to(orig_dtype)
 
         if dev.type == "cuda":
-            torch.cuda.empty_cache()
+            mm.soft_empty_cache()
 
         return ({"samples": out},)
 

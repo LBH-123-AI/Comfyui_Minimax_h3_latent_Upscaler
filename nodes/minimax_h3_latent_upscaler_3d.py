@@ -27,9 +27,16 @@ from typing import TypedDict
 
 try:
     import comfy.model_management as mm
+    import comfy.utils
     HAS_COMFY_MM = True
 except ImportError:
     HAS_COMFY_MM = False
+
+from .comfy_dynamic import (
+    build_comfy_model,
+    estimate_upscale_activation_memory,
+    force_unload_patcher,
+)
 
 try:
     from comfy_api.latest import ComfyExtension, io
@@ -354,17 +361,11 @@ def scan_models():
     return names if names else [f"(place models in: {get_models_dir()})"]
 
 def _load_raw_sd(path):
-    if path.endswith('.safetensors'):
-        try:
-            from safetensors import safe_open
-            with safe_open(path, framework="pt", device="cpu") as f:
-                sd = {k: f.get_tensor(k) for k in f.keys()}
-        except ImportError:
-            from safetensors.torch import load_file
-            sd = load_file(path, device='cpu')
-    else:
-        sd = torch.load(path, map_location='cpu', weights_only=False)
-
+    sd = comfy.utils.load_torch_file(
+        path,
+        safe_load=True,
+        device=torch.device("cpu"),
+    )
     if isinstance(sd, dict) and 'model' in sd:
         sd = sd['model']
     sd = {k: v.to(torch.float16) if v.dtype == torch.float8_e4m3fn else v
@@ -418,8 +419,7 @@ def load_model(name, device, precision):
     backend_lbl = _backend_label(device)
     cache_key = f"{name}::{backend_lbl}::{precision}"
     if cache_key in MODEL_CACHE:
-        model = MODEL_CACHE[cache_key]
-        return model.to(device, non_blocking=True)
+        return MODEL_CACHE[cache_key]
 
     try:
         path = folder_paths.get_full_path_or_raise(_LATENT_UPSCALE_FOLDER, name)
@@ -429,25 +429,39 @@ def load_model(name, device, precision):
     raw_sd = _load_raw_sd(path)
     up_sd = _extract_upscaler_sd(raw_sd)
     cfg = _detect_arch(up_sd)
-
-    model = LatentResizer3D(
-        in_channels=cfg["in_channels"], in_blocks=cfg["in_blocks"], out_blocks=cfg["out_blocks"],
-        channels=cfg["channels"], dropout=cfg["dropout"], attn=cfg["attn"],
-        temporal_every=cfg["temporal_every"], temporal_kernel=cfg["temporal_kernel"],
+    dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(
+        precision, torch.float32
     )
-    model.load_state_dict(up_sd, strict=True)
-    dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(precision, torch.float32)
-    model = model.to(device).eval().requires_grad_(False)
-    if dtype != torch.float32:
-        model = model.to(dtype)
 
-    MODEL_CACHE[cache_key] = model
+    def factory():
+        return LatentResizer3D(
+            in_channels=cfg["in_channels"],
+            in_blocks=cfg["in_blocks"],
+            out_blocks=cfg["out_blocks"],
+            channels=cfg["channels"],
+            dropout=cfg["dropout"],
+            attn=cfg["attn"],
+            temporal_every=cfg["temporal_every"],
+            temporal_kernel=cfg["temporal_kernel"],
+        )
+
+    patcher, _ = build_comfy_model(
+        factory,
+        up_sd,
+        requested_device=device,
+        dtype=dtype,
+        strict=True,
+    )
+
+    MODEL_CACHE[cache_key] = patcher
+    model = patcher.model
     print(f"[MinimaxH3-3D] Loaded upscale model: {name}")
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,} | "
           f"Attn: forced off | Temporal: {'on' if cfg['temporal_every'] > 0 else 'off'} "
           f"(every={cfg['temporal_every']}, kernel={cfg['temporal_kernel']}) | "
-          f"Backend: {backend_lbl} | Precision: {precision}")
-    return model
+          f"Backend: {_backend_label(patcher.load_device)} | Precision: {precision} | "
+          f"DynamicVRAM: {'on' if patcher.is_dynamic() else 'fallback'}")
+    return patcher
 
 # ==========================================
 # ComfyUI node (new API)
@@ -527,7 +541,9 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
         orig_dtype = src.dtype
         was_4d = (src.dim() == 4)
 
-        dev = _resolve_device(device)
+        requested_dev = _resolve_device(device)
+        model_patcher = load_model(model_name, requested_dev, precision)
+        dev = model_patcher.load_device
         compute_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[precision]
 
         s = src.to(device=dev, dtype=compute_dtype, copy=True)
@@ -578,8 +594,24 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
               f"Pixels {w_out * downsample}x{h_out * downsample} | scale={effective_scale:.3f}")
 
         # 3. Inference
-        model = load_model(model_name, dev, precision)
+        model = model_patcher.model
         norm_mean, norm_std = _make_norm_tensors(dev, compute_dtype)
+
+        temporal_kernel = 0
+        for block in model.in_blocks:
+            if isinstance(block, TemporalConv):
+                temporal_kernel = block.dwconv.kernel_size[0]
+                break
+
+        memory_required = estimate_upscale_activation_memory(
+            s.shape,
+            (h_out, w_out),
+            model.conv_in.out_channels,
+            compute_dtype,
+            temporal_chunk=32 if enable_temporal_chunking else None,
+            temporal_overlap=temporal_kernel,
+        )
+        mm.load_models_gpu([model_patcher], memory_required=memory_required)
 
         with torch.inference_mode():
             s_norm = (s - norm_mean) / norm_std
@@ -599,8 +631,8 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
         # 4. VRAM Management
         if dev.type == "cuda":
             if force_unload:
-                model.to("cpu", non_blocking=True)
-                print("[MinimaxH3-3D] ✅ Model offloaded to CPU. VRAM released.")
+                force_unload_patcher(model_patcher)
+                print("[MinimaxH3-3D] ✅ Legacy force_unload: model offloaded through ComfyUI.")
             if HAS_COMFY_MM:
                 mm.soft_empty_cache()
             else:
