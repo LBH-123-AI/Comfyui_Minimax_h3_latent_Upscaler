@@ -14,6 +14,9 @@ Learned · High-fidelity · 2D & 3D Variants
 
 ## 📰 News
 
+- [2026-11-10] 🚀 **New 2D-conv release — `minimax_h3_latent_upscaler_2d_conv_v1`**: a 2D conv backbone (Conv2d) with interleaved temporal Conv1d — **182M parameters** (3D: 345M, roughly half) and a **~364 MB** fp16 checkpoint (3D: ~691 MB). Across all 36 scales it cuts latent MSE by **84.7%** vs trilinear (3D: 61.1%); below 1.5× it still delivers ~**80%** (3D only 28%); pixel-domain PSNR averages **30.47 dB** (3D: 29.30 dB). It also offers **6 sharpness tiers** (the 3D model has none) and covers the full 1.1×–4.0× range. The 3D model only leads on the scales it was trained on (2×/2.25×/2.5×/4×), and that lead is small: measured on the shared trilinear baseline, 2D lands at **83.0%–86.4%** and 3D at **84.7%–89.1%** — a **1.0–3.3 percentage-point** gap (absolute MSE difference 0.004–0.024). The "3D is 7.5%–30.5% better" figure is a relative difference on top of that already tiny residual, not a difference in overall quality. Temporal consistency is only marginally better too (frame-diff ratio 0.867 vs 0.850). See the [full comparison report](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/blob/main/examples/3D_Conv_v1_vs_2D_Conv_v1.html) and the per-scale chart below.
+- [2026-11-10] 🧩 **2D node brought up to parity with 3D**: three resize modes (`scale by multiplier` / `target dimensions` / `megapixels`), `rocm` backend, `force_unload` VRAM offload, pixel-grid `align`; plus a new **Sharpness** tier selector (1–6) and **Temporal Chunking** (`chunked` / `single pass`).
+
 - [2026-08-28] 🚀 **New node combo — MMH3 Split Upscale**: three new nodes (`MMH3 Temporal Split Params`, `MMH3 Spatial Split Params`, `MMH3 Split Upscale`) perform a tiled, hires-fix style latent re-sampling upscale for H3 video. Decomposed and optimized from the **Comfyui-MMH3-UltimateUpscale** project — splitting the AV latent into temporal chunks and spatial tiles, resampling each piece, and stitching with seam denoise, two-level color matching and temporal anchors. Key upgrades vs. original: more stable seams (`seam_denoise` + probe-gated seam polish), zero color drift (two-level matching + first-block/every-chunk pin-source), triple temporal anchors (frame-0/motion/identity), easier use (spatial params simplified to overlap/fade percentages snapping to the latent grid), and a lighter footprint (built-in upscale model removed in favor of an external pre-upscaled latent).
 - [2026-08-26] 🚀 **3D node memory & UX optimizations**: zero-copy model loading plus ComfyUI's native `soft_empty_cache` and explicit `.contiguous()` calls reduce RAM/VRAM spikes during load and inference; the post-inference CPU offload is now an optional `force_unload` toggle (default on); `enable_chunking` is renamed to `enable_temporal_chunking` and its effective chunk stride raised from 24 to 32; model files can now live in subfolders (PR #30); `target dimensions` and `megapixels` upper limits raised to 8192 px and 16 MP.
 - [2026-08-23] 🚀 **3D node improvements**: added an `enable_chunking` toggle (turn off for short clips to use full-context inference); fixed temporal-chunk edge artifacts with replicate padding and weighted overlap blending, eliminating end-frame flicker; added ROCm (AMD GPU) backend support via the new `rocm` device option.
@@ -38,26 +41,45 @@ It also **avoids the ghosting / double-image artifacts** that naive latent inter
 ⚠️ This saves **time, not VRAM** — the refinement pass still runs at the target resolution, so
 peak memory is comparable to generating high-res directly. The win is purely speed.
 
-Two node variants are provided, both registered under the `video/MinimaxH3` category:
+Two node variants are provided, both registered under the `video/MinimaxH3` category. Their
+parameters are **almost identical** — the 2D node adds a `sharpness` selector and exposes temporal
+chunking as a dropdown, the 3D node as a boolean toggle:
 
-- **Minimax H3 Latent Upscaler (2D)** — a 2D ResBlock backbone with Temporal 3D-Conv layers
-  inserted for temporal consistency. Spatial (H×W) upscaling; the time dimension is preserved.
-  Lightweight and fast. Uses a simple `scale` factor (1.0×–4.0×).
-- **Minimax H3 Latent Upscaler (3D)** — a fully 3D-convolution backbone (3D ResBlocks +
-  TemporalConv + trilinear interpolation). Processes the spatiotemporal volume jointly for
-  stronger temporal coherence; heavier on compute/memory. Supports **three resize modes** in one
-  node:
-  - `scale by multiplier` — classic `scale` factor (1.0×–4.0×).
-  - `target dimensions` — directly set target pixel `width`/`height`.
-  - `megapixels` — set a target total pixel count in megapixels (e.g. `1.2`); keeps aspect ratio.
-  Both `target dimensions` and `megapixels` modes align the output to a configurable pixel grid and
-  derive the effective scale automatically.
+- **Minimax H3 Latent Upscaler (2D)** — a 2D conv backbone with interleaved temporal convolutions.
+  Spatial (H×W) upscaling only; the time dimension is preserved. Lightweight and fast. Pairs with
+  the `*_2d_conv_v1` checkpoint and supports 6 sharpness tiers.
+- **Minimax H3 Latent Upscaler (3D)** — a fully 3D-convolution backbone (3D conv blocks +
+  TemporalConv + trilinear interpolation). Processes the spatiotemporal volume jointly for slightly
+  better temporal coherence, at ~1.9× the parameters and compute. Pairs with `*_3d_conv_v1`.
 
-> The 3D node computes the equivalent `scale` internally for the size-based modes and feeds it to
-> the same trained model, so any target between 1.0×–4.0× works.
+> Weights and backbone must match: the 2D node loads 2D checkpoints, the 3D node loads 3D
+> checkpoints. Picking the wrong one fails loudly with a structure mismatch instead of silently
+> producing garbage.
+
+Both nodes ship **three resize modes**:
+
+- `scale by multiplier` — classic `scale` factor (1.0×–4.0×).
+- `target dimensions` — directly set target pixel `width`/`height`.
+- `megapixels` — set a target total pixel count in megapixels (e.g. `1.2`); keeps aspect ratio.
+
+The `target dimensions` and `megapixels` modes align the output to a configurable pixel grid and
+derive the effective scale automatically, so any target between 1.0×–4.0× works.
 
 > Both nodes support **upscaling only** (`effective scale >= 1.0`). `scale = 1.0` returns the input
 > unchanged; an effective scale below `1.0` raises an error.
+
+### Sharpness tiers (2D checkpoints only)
+
+Checkpoints with a tier channel expose a `Sharpness` parameter (1–6):
+
+- **1** = closest to the reference (softest, lowest MSE) — the default and the recommended setting.
+- **6** = sharpest (most detail, furthest from the exact target).
+
+Older checkpoints without a tier channel silently ignore it (treated as 1) and print a one-line
+notice in the console.
+
+> Sharpness exists only in the `2d_conv_v1` weights: `3d_conv_v1` has no adjustable sharpness, and
+> its output sharpness measures equivalent to 2D tier t1.
 
 ### MMH3 Split Upscale (combo)
 
@@ -105,6 +127,9 @@ i.e. it re-runs sampling at the higher resolution.
 
 ![](examples/Minimax_h3_latent_Upscaler_002.jpg)
 
+**2D vs 3D across all 36 scales** — full MSE / PSNR / sharpness / temporal charts:
+[`examples/3D_Conv_v1_vs_2D_Conv_v1.html`](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/blob/main/examples/3D_Conv_v1_vs_2D_Conv_v1.html).
+
 ---
 
 ## 📁 Project Structure
@@ -113,12 +138,13 @@ i.e. it re-runs sampling at the higher resolution.
 Comfyui_Minimax_h3_latent_Upscaler/
 ├── examples/
 │   ├── Minimax_h3_latent_Upscaler_001.mp4
-│   └── Minimax_h3_latent_Upscaler_002.jpg
+│   ├── Minimax_h3_latent_Upscaler_002.jpg
+│   └── 3D_Conv_v1_vs_2D_Conv_v1.png     # per-scale MSE chart (2D vs 3D)
 ├── workflow_templates/
 │   └── minimax_h3_r2v_Latent Upscaler example workflow.json  # example workflow for ComfyUI templates
 ├── nodes/
 │   ├── __init__.py                       # merges 2D/3D/Split node mappings
-│   ├── minimax_h3_latent_upscaler_2d.py  # 2D backbone + Temporal 3D Conv (scale mode)
+│   ├── minimax_h3_latent_upscaler_2d.py  # 2D backbone + temporal convs (3 resize modes + sharpness + chunking)
 │   ├── minimax_h3_latent_upscaler_3d.py  # pure 3D convolution with 3 resize modes
 │   └── MMH3_Split_Upscale.py             # MMH3 Split Upscale combo (decomposed from Comfyui-MMH3-UltimateUpscale)
 ├── README.md
@@ -135,9 +161,15 @@ Comfyui_Minimax_h3_latent_Upscaler/
 
 - ✅ **Learned latent upscaling** — neural network trained for Minimax H3 latents, far sharper
   than bilinear/bicubic interpolation.
-- ✅ **Two backbones** — pick the fast **2D** variant or the temporally-coherent **3D** variant.
-- ✅ **Three ways to set output size on the 3D node** — `scale by multiplier`, `target dimensions`,
+- ✅ **Two backbones, two checkpoints** — `2d_conv_v1` covers every scale at half the size with
+  adjustable sharpness; `3d_conv_v1` is more accurate on 2×/2.25×/2.5×/4× and marginally better on
+  temporal consistency (frame-diff ratio 0.867 vs 0.850). Node and checkpoint pair one-to-one.
+- ✅ **Three ways to set output size on both nodes** — `scale by multiplier`, `target dimensions`,
   or `megapixels`, all with pixel-grid alignment and aspect-ratio lock.
+- ✅ **Sharpness tiers** — one checkpoint spans 1 (most faithful) to 6 (sharpest), so you don't need
+  a separate file per look.
+- ✅ **Temporal chunking** — `chunked` caps VRAM on long clips, `single pass` runs the whole clip in
+  one forward pass; older workflows keep working.
 - ✅ **Tiled hires-fix upscaler (MMH3 Split Upscale combo)** — re-sample the H3 AV latent at higher
   resolution by splitting into temporal chunks + spatial tiles, with seam-denoise, two-level color
   matching and temporal anchors to avoid seams and ghosting.
@@ -147,7 +179,9 @@ Comfyui_Minimax_h3_latent_Upscaler/
   kernel size straight from the checkpoint; no manual config needed.
 - ✅ **Robust weight loader** — supports `.safetensors` and `.pth`; auto-converts FP8→FP16;
   tolerates the `upscaler.` prefix in merged checkpoints.
-- ✅ **Flexible precision/device** — `cuda`/`cpu` and fp32/fp16/bf16 options.
+- ✅ **Strict weight validation** — missing key layers raise an error instead of silently
+  random-initializing (which would produce noise).
+- ✅ **Flexible precision/device** — `cuda`/`rocm`/`cpu` and fp32/fp16/bf16 options.
 - ✅ **Plug-and-play** — standard ComfyUI node, no changes to your existing workflow.
 
 Inference forces attention **off** (`attn=False`) for speed and stability. Loaded models are
@@ -185,8 +219,77 @@ automatically in the node's `model_name` dropdown.
 Pre-trained checkpoints are available at:
 [huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
 
-The loader auto-detects the architecture, so a single checkpoint works for both the 2D and 3D
-nodes as long as the stored structure matches.
+Every release ships three precisions — pick one that fits your GPU:
+
+| Release | fp16 / bf16 | fp32 (.pth) | Parameters |
+| :--- | :--- | :--- | ---: |
+| `minimax_h3_latent_upscaler_2d_conv_v1` (2D backbone) | ~364 MB | ~729 MB | 182M |
+| `minimax_h3_latent_upscaler_3d_conv_v1` (3D backbone) | ~691 MB | ~1.38 GB | 345M |
+
+**fp16 is the recommended default**: it is numerically almost identical to fp32. Use `bf16` on GPUs
+without fp16 fast paths (same size, slightly lower accuracy); `fp32` is the reference checkpoint for
+conversion and bit-exact verification.
+
+The loader auto-detects the architecture (channel count, block counts, temporal config, tier
+channel), so **checkpoints are not interchangeable between the two nodes**: `2d_conv_v1` only
+loads in the 2D node, `3d_conv_v1` only in the 3D node.
+
+### Which checkpoint: 2D or 3D?
+
+Measured on the same frozen 2,500-pair validation split:
+
+| Metric (average over 36 scales) | Trilinear | 2D_Conv_v1 | 3D_Conv_v1 |
+| :--- | ---: | ---: | ---: |
+| latent MSE improvement vs trilinear | — | **84.7%** | 61.1% |
+| Improvement below 1.5× | — | **~80%** | 28% |
+| Pixel-domain PSNR (after VAE decode) | 23.54 dB | **30.47 dB** | 29.30 dB |
+| Temporal consistency (latent frame-diff ratio, truth = 1.000) | 0.900 | 0.850 | **0.867** |
+| Adjustable sharpness | — | **6 tiers** | none |
+| Parameters / fp16 size | — | **182M / 364 MB** | 345M / 691 MB |
+
+**Raw latent MSE across all 36 scales (lower is better)**
+
+![3D_Conv_v1 vs 2D_Conv_v1 · per-scale latent MSE](examples/3D_Conv_v1_vs_2D_Conv_v1.png)
+
+> Grey = trilinear, blue = `2D_Conv_v1` (t1), orange = `3D_Conv_v1`. 2D stays pinned to the floor as
+> an almost flat line, holding 11%–15% of trilinear's error at every scale; 3D only dips below 2D at
+> the scales it was trained on (2×/2.25×/2.5×/4×) and bounces back elsewhere — at 1.1× it nearly
+> coincides with trilinear (0.133 vs 0.138), and at 1.3×/2.2× it only improves by 30%–45%. This chart
+> is the most direct illustration of "2D wins coverage, 3D wins specific scales".
+
+- **2D wins on coverage**: a large advantage below 1.5×, adjustable sharpness, half the size.
+- **3D wins on the scales it was trained on, but the margin is small**: only 2×/2.25×/2.5×/4× flip,
+  details in the table below.
+
+**The four scales where 3D leads (common baseline: improvement vs trilinear)**
+
+| Scale | Trilinear MSE | 2D_Conv_v1 MSE (improvement) | 3D_Conv_v1 MSE (improvement) | 3D vs 2D |
+| :--- | ---: | ---: | ---: | ---: |
+| 2× | 0.32384 | 0.05489 (+83.0%) | **0.04947 (+84.7%)** | 11.0% lower |
+| 2.25× | 0.40259 | 0.05475 (+86.4%) | **0.05091 (+87.4%)** | 7.5% lower |
+| 2.5× | 0.46205 | 0.06644 (+85.6%) | **0.05906 (+87.2%)** | 12.5% lower |
+| 4× | 0.73592 | 0.10464 (+85.8%) | **0.08016 (+89.1%)** | 30.5% lower |
+
+How to read it: against the shared trilinear baseline both models land in the **83%–89%** band, and
+3D is only **1.0–3.3 percentage points** ahead (absolute MSE difference 0.004–0.024). The 7.5%–30.5%
+column is a relative difference computed on that already-tiny residual, not a 30% quality gap.
+
+**Temporal consistency** (latent frame-diff ratio; 1.000 = same frame-to-frame dynamics as the truth,
+<1 = "quieter" than the truth, >1 = "jitterier"):
+
+| Scale | LR as-is | Trilinear | 2D_Conv_v1 | 3D_Conv_v1 | 3D vs 2D |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| 1.5× | 1.019 | 0.880 | 0.848 | 0.857 | closer to truth by 0.009 |
+| 2× | 1.031 | 0.869 | 0.900 | 0.908 | closer to truth by 0.008 |
+| 3× | 1.032 | 0.904 | 0.892 | 0.898 | closer to truth by 0.006 |
+| 4× | 1.069 | 0.946 | 0.761 | 0.805 | closer to truth by 0.044 |
+| **Average** | 1.038 | 0.900 | 0.850 | **0.867** | **+0.017** |
+
+All three average below 1.000, i.e. every output is a little "quieter" than the truth (some fine
+detail or motion gets smoothed away). 3D's 0.867 sits closer to 1.000 than 2D's 0.850, and the gap
+peaks at 4× (0.805 vs 0.761); between 1.5× and 3× it stays under 0.01, i.e. not visible. **So the
+"better temporal consistency" claim only carries real weight at 4×.** (At 2× trilinear's 0.869 is
+closest to 1.000, but that is interpolation ringing amplifying frame noise, not more faithful detail.)
 
 ---
 
@@ -205,8 +308,9 @@ upscaling directly in latent space skips the expensive VAE decode/encode round-t
 saved. It also avoids the **ghosting / double-image artifacts** that direct latent interpolation
 (bilinear/bicubic) causes.
 
-⚠️ **Saves time, not VRAM:** the refinement still runs at the target resolution, so peak memory is
-roughly the same as generating high-res directly. The benefit is purely faster turnaround.
+⚠️ **VRAM expectations:** this node only saves time — refinement still runs at the target resolution,
+so peak memory is close to generating high-res directly. Use `Temporal Chunking` to cap peaks on long
+clips.
 
 ### Node Reference — 2D
 
@@ -214,9 +318,18 @@ roughly the same as generating high-res directly. The benefit is purely faster t
 | :--- | :--- | :--- | :--- | :--- |
 | `latent` | LATENT | — | — | Input Minimax H3 latent (B,C,T,H,W) or (B,C,H,W) |
 | `model_name` | dropdown | auto | scanned files | Checkpoint in `latent_upscale_models/` |
-| `scale` | FLOAT | 2.0 | 1.0 – 4.0 (step 0.1) | Spatial upscale factor |
-| `device` | dropdown | cuda | cuda / cpu | Inference device |
-| `precision` | dropdown | fp32 | fp32 / fp16 / bf16 | Inference precision |
+| `mode` | dropdown | `scale by multiplier` | `scale by multiplier` / `target dimensions` / `megapixels` | How the output size is chosen |
+| `scale` | FLOAT | 2.0 | 1.0 – 4.0 (step 0.05) | Used when `mode` is `scale by multiplier` |
+| `width` | INT | 1280 | 64 – 8192 (step 8) | Target pixel width (used by `target dimensions`) |
+| `height` | INT | 704 | 64 – 8192 (step 8) | Target pixel height (used by `target dimensions`) |
+| `megapixels` | FLOAT | 1.0 | 0.1 – 16.0 (step 0.1) | Target total megapixels (used by `megapixels`); keeps aspect ratio |
+| `sharpness` | INT | 1 | 1 – 6 | **Sharpness.** 1 = closest to the reference (softest, lowest MSE); 6 = sharpest (most detail, furthest from the exact target). Only checkpoints with a tier channel respond; older ones fall back to 1 |
+| `align` | INT | 32 | 1 – 512 | Pixel-grid alignment: output W/H are independently rounded to multiples of this value (strictly recommended: 32) |
+| `temporal_chunking` | dropdown | `chunked` | `chunked` / `single pass` | **Temporal Chunking.** Chunked inference caps VRAM on long clips; `single pass` runs one forward pass for the whole clip (most VRAM) |
+| `chunk_frames` | INT | 32 | 4 – 256 (step 4) | **Frames per chunk.** Only shown under `chunked`. Each chunk actually forwards this value + 48 frames of temporal context, so don't go too small if you have headroom |
+| `force_unload` | BOOLEAN | True | True / False | Unload model to CPU after inference to free VRAM for subsequent nodes; disable if you reuse this node repeatedly |
+| `device` | dropdown | cuda | cuda / rocm / cpu | Inference backend (ROCm needs a HIP-enabled PyTorch build) |
+| `precision` | dropdown | fp16 | fp32 / fp16 / bf16 | Inference precision |
 
 **Output:** `LATENT` — the upscaled latent, ready for VAE decode.
 
@@ -235,13 +348,15 @@ roughly the same as generating high-res directly. The benefit is purely faster t
 | `enable_temporal_chunking` | BOOLEAN | True | True / False | Split long videos into temporal chunks to cap VRAM; disable for short clips for full-context inference |
 | `force_unload` | BOOLEAN | True | True / False | Unload model to CPU after inference to free VRAM for subsequent nodes; disable if you reuse this node repeatedly to avoid reload overhead |
 | `device` | dropdown | cuda | cuda / rocm / cpu | Inference backend (ROCm needs a HIP-enabled PyTorch build) |
-| `precision` | dropdown | fp32 | fp32 / fp16 / bf16 | Inference precision |
+| `precision` | dropdown | fp16 | fp32 / fp16 / bf16 | Inference precision |
 
 **Output:** `LATENT` — the upscaled latent.
 
-> **Which node to pick?** Use **2D** for speed and when frames are already temporally stable; use
-> **3D** when you need stronger motion/temporal coherence or prefer specifying output size by
-> `target dimensions` / `megapixels`.
+> **Which node to pick?** Default to **2D**: full 1.1×–4.0× coverage, a big advantage at low scales,
+> half the file size, adjustable sharpness. Only switch to **3D** when you consistently run
+> 2×/2.25×/2.5×/4× and want the extra accuracy — its latent MSE is 7.5%–30.5% lower there (absolute
+> difference 0.004–0.024; on the trilinear baseline, 2D ≈ 85% vs 3D ≈ 87%, a 1–3 point gap), and its
+> temporal consistency is only marginally better.
 
 ### Node Reference — MMH3 Split Upscale (combo)
 
@@ -305,40 +420,49 @@ Outputs: `spatial_split_param` (custom type) + `grid_preview` (string, shows the
 
 - **Latent format:** 24-channel Minimax H3 VAE latent, normalized per-channel with the training
   mean/std before inference and de-normalized after.
-- **Default detected architecture** (overridden automatically if the checkpoint differs):
-  `in_channels=24`, `in_blocks=12`, `out_blocks=12`, `base_channels=512`, `dropout=0.1`,
-  `temporal_every=2`, `temporal_kernel=5`, `attn=False`.
-- **Interpolation:** the 2D node uses bilinear feature interpolation; the 3D node uses trilinear.
-- **Temporal handling:** both variants preserve the time dimension (only H×W are scaled).
+- **Backbone:** the 2D variant stacks Conv2d blocks (with a 7×7 depthwise large-kernel block every
+  3 layers) and interleaves a temporal Conv1d every 2 layers; the 3D variant is pure 3D conv blocks +
+  temporal convolutions. **Residuals exist only inside blocks** — each block returns `x + f(x)` via a
+  1×1 skip or identity — while the backbone as a whole has **no global residual**: the output is
+  produced entirely by the convolutional path with no interpolated/input base added on top.
+- **Architecture is inferred from the checkpoint**: `in_channels`, block counts, `channels`, temporal
+  config, kernel size, CoordConv/SE/large-kernel flags, learned-upsample branch and tier channel are
+  all read from the `state_dict` shapes and key names — no manual config. Both releases use 12+12
+  blocks, `temporal_every=2`, `temporal_kernel=5`, `attn=False`; 2D uses `channels=640` (182M
+  parameters) and 3D uses `channels=512` (345M).
+- **Upsampling:** if the checkpoint carries learned PixelShuffle kernels (`learned_upsample_ks`) they
+  are used; otherwise it falls back to feature interpolation — bilinear for the 2D node, trilinear
+  for the 3D node. The console prints which path was taken.
+- **Temporal handling:** both variants preserve the time dimension (only H×W are scaled); chunked
+  inference caps VRAM on long clips.
+- **Sharpness tiers:** checkpoints with a tier channel encode `sharpness` into a 32-dim condition fed
+  alongside the scale condition; the tier channel is zero-initialized, so checkpoints without it
+  behave bit-identically to the previous version.
 
 ---
 
 ## 📊 Training Data
 
-The upscaler was trained on **~80,000 paired samples** (a low-resolution latent paired with its
-high-resolution target), balanced across modalities and scale factors to maximize generalization.
+Training data totals **~160,000 independent pairs** (one low-res latent paired with one high-res
+target, excluding sharpness copies): **146,945 pairs** drive the main (scale) training, and
+**13,967 groups** of separate footage train the sharpness tiers — each group paired with 1–6 tier
+targets, **83,802 pairs** in total.
 
-**By data modality:**
+**By upscale factor (share of the main training set, measured):**
 
-| Modality | Pairs | Share |
-| :--- | :--- | :--- |
-| Video clips | ~70,000 | ~87.5% |
-| 2K images | ~8,000 | ~10% |
+| Scale band | Pairs | Share |
+| :--- | ---: | ---: |
+| < 1.5× | 13,649 | 9.3% |
+| 1.5× – 2.5× | 70,773 | 48.2% |
+| 2.5× – 3.5× | 45,023 | 30.6% |
+| 3.5× – 4.0× | 17,500 | 11.9% |
+| **Total** | **146,945** | 100% |
 
-**By upscale factor (scale distribution, approximate):**
-
-| Scale | Share | Note |
-| :--- | :--- | :--- |
-| 2× | 40% | Dominant factor — the most common real-world case |
-| 1.5× | 10% | — |
-| 2.5× | 10% | — |
-| 3× | 10% | — |
-| 4× | 10% | — |
-| 1.0×–4.0× (arbitrary decimals) | 10% | Improves generalization to in-between / non-fixed scales |
-
-The heavy emphasis on **2× (40%)** matches the most common practical use case, while the **10% spread
-of arbitrary decimal scales between 1 and 4** prevents overfitting to the fixed 1.5×/2×/2.5×/3×/4×
-buckets — letting the model handle any continuous `scale` in the 1.0×–4.0× range at inference time.
+The five dominant factors are **2.0× (32,624 pairs, 22.2%), 2.5× (15,000, 10.2%), 4.0× (10,500,
+7.2%), 1.5× (11,150, 7.6%) and 3.0× (10,824, 7.4%)**; the remaining 0.25-step scales mostly hold
+2–3k pairs each (~2.25%). Beyond the fixed buckets, the set includes arbitrary decimal scales between
+1.0× and 4.0× so the model generalizes to any continuous `scale` value instead of only the fixed
+buckets.
 
 ---
 
