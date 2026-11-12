@@ -33,6 +33,7 @@ except ImportError:
 
 try:
     from comfy_api.latest import ComfyExtension, io
+    from comfy.nested_tensor import NestedTensor
     from typing_extensions import override
     USE_NEW_API = True
 except ImportError:
@@ -63,6 +64,10 @@ except ImportError:
             def Input(*args, **kwargs): return args[0] if args else "DYNAMIC"
             class Option: pass
     class ComfyExtension: pass
+    class NestedTensor:
+        def __init__(self, tensors):
+            self.tensors = list(tensors)
+            self.is_nested = True
     def override(func): return func
 
 # ==========================================
@@ -521,9 +526,13 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
 
         if model_name.startswith('('):
             raise ValueError("Please place model files into the latent_upscale_models directory")
+        
+        # ---- AV：只取视频流处理，音频留在原 dict 里不动 ----
+        src = latent["samples"]
+        is_av = getattr(src, "is_nested", False)
+        if is_av: src = src.unbind()[0]
 
         selected_mode = mode["mode"]
-        src = latent["samples"]
         orig_dtype = src.dtype
         was_4d = (src.dim() == 4)
 
@@ -607,6 +616,7 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
                 torch.cuda.empty_cache()
             gc.collect()
 
+        latent["samples"] = NestedTensor((out, latent["samples"].unbind()[1])) if is_av else out
         return io.NodeOutput({"samples": out})
 
 # ==========================================
